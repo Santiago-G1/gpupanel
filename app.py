@@ -253,6 +253,11 @@ def is_https(request: Request) -> bool:
     return request.headers.get("x-forwarded-proto", request.url.scheme) == "https"
 
 
+def same_text(a: str, b: str) -> bool:
+    """compare_digest for text. A non-ASCII password must be a 401, not a 500."""
+    return secrets.compare_digest(a.encode("utf-8", "replace"), b.encode("utf-8", "replace"))
+
+
 def make_session(user: str) -> str:
     payload = {"u": user, "exp": int(time.time()) + SESSION_TTL, "n": secrets.token_urlsafe(12)}
     body = _b64e(json.dumps(payload, separators=(",", ":")).encode())
@@ -287,8 +292,8 @@ def read_session(request: Request) -> str:
 def has_bearer(request: Request) -> bool:
     header = request.headers.get("authorization", "")
     return bool(PANEL_TOKEN) and (
-        secrets.compare_digest(header, f"Bearer {PANEL_TOKEN}")
-        or secrets.compare_digest(request.headers.get("x-api-token", ""), PANEL_TOKEN)
+        same_text(header, f"Bearer {PANEL_TOKEN}")
+        or same_text(request.headers.get("x-api-token", ""), PANEL_TOKEN)
     )
 
 
@@ -787,7 +792,7 @@ def howto(request: Request):
 def login(request: Request, body: dict = Body(...)):
     user = str(body.get("user") or "").strip()
     password = str(body.get("password") or "")
-    ok = bool(PANEL_PASSWORD) and secrets.compare_digest(user, PANEL_USER) and secrets.compare_digest(password, PANEL_PASSWORD)
+    ok = bool(PANEL_PASSWORD) and same_text(user, PANEL_USER) and same_text(password, PANEL_PASSWORD)
     if not ok:
         time.sleep(LOGIN_DELAY)
         raise HTTPException(401, "wrong user or password")
