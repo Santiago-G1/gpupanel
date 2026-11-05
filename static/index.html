@@ -175,6 +175,9 @@ const MODES = {
 
 const DEVICES = {nvenc: 'GPU (NVENC)', vaapi: 'integrated GPU (VAAPI)', none: 'CPU'};
 const str = (v) => (typeof v === 'string' ? v : '');
+// nvidia-smi answers N/A for anything the card does not report.
+const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : null; };
+const gib = (mib) => (mib / 1024).toFixed(1);
 const deviceLabel = (a) => DEVICES[a] || a || '—';
 
 /* ---------------------------------------------------------------- feedback */
@@ -331,9 +334,17 @@ function paintState(s) {
 function syncPower() {
   const btn = $('pl-apply');
   const watts = Number($('pl').value);
-  const limits = last && last.gpu && Array.isArray(last.gpu.power_limits)
-    ? last.gpu.power_limits.map(Number) : [];
+  const card = (last && last.gpu) || {};
+  const range = num(card.power_min) !== null && num(card.power_max) !== null;
+  const limits = Array.isArray(card.power_limits) ? card.power_limits.map(Number) : [];
   const same = limits.length > 0 && limits.every((l) => l === watts);
+  if (!range) {
+    // Some cards (and every vGPU) do not expose a settable range.
+    btn.textContent = 'Power limit not settable';
+    btn.title = 'nvidia-smi does not report a supported range for this card';
+    btn.disabled = true;
+    return;
+  }
   btn.textContent = same ? 'Apply ' + watts + ' W (already active)' : 'Apply ' + watts + ' W';
   // setBusy() restores the button afterwards.
   if (!btn.classList.contains('busy')) btn.disabled = same;
@@ -385,7 +396,9 @@ async function refresh() {
     ? `${gpus.length} × ${g.name} · driver ${g.driver}`
     : `${g.name} · driver ${g.driver}`;
   $('gpu-cards').innerHTML = gpus.map((x) => {
-    const usedPct = Math.round(100 * x.mem_used / x.mem_total);
+    const used = num(x.mem_used), total = num(x.mem_total);
+    const util = num(x.util);
+    const usedPct = used !== null && total ? Math.round(100 * used / total) : undefined;
     const link = x.pcie_gen && x.pcie_gen !== 'N/A'
       ? `PCIe Gen${x.pcie_gen} ×${x.pcie_width}` : '';
     return `<div style="margin-bottom:14px">
@@ -395,8 +408,8 @@ async function refresh() {
         <span class="pill ${Number(x.util) > 0 ? 'ok' : 'off'}">${Number(x.util) > 0 ? 'busy' : 'idle'}</span>
       </div>
       <div class="grid">${
-        card('Utilization', x.util + ' %', x.util) +
-        card('VRAM', `${(x.mem_used/1024).toFixed(1)} / ${(x.mem_total/1024).toFixed(1)} GiB`, usedPct) +
+        card('Utilization', util !== null ? util + ' %' : 'N/A', util ?? undefined) +
+        card('VRAM', used !== null && total !== null ? `${gib(used)} / ${gib(total)} GiB` : 'N/A', usedPct) +
         card('Temperature', x.temp + ' °C') +
         card('Power', `${x.power_draw} / ${x.power_limit} W`) +
         card('SM / Mem clock', `${x.clk_sm} / ${x.clk_mem} MHz`)
@@ -404,9 +417,15 @@ async function refresh() {
     </div>`;
   }).join('');
   $('pl-now').textContent = gpus.map((x) => x.power_limit).join(' / ') + ' W';
-  $('pl-range').textContent = `${g.power_min}–${g.power_max} W`;
+  const plMin = num(g.power_min), plMax = num(g.power_max);
+  $('pl-range').textContent = plMin !== null && plMax !== null
+    ? `${plMin}–${plMax} W` : 'not reported by the card';
   const pl = $('pl');
-  pl.min = g.power_min; pl.max = g.power_max;
+  if (plMin !== null && plMax !== null) {
+    pl.min = plMin; pl.max = plMax;
+    // A default of 150 W is outside the range of some cards.
+    pl.value = String(Math.min(Math.max(Number(pl.value) || plMin, plMin), plMax));
+  }
   $('pl-val').textContent = pl.value + ' W';
   const procs = gpus.flatMap((x) => (x.processes || []).map((p) => ({...p, gpu: x.index})));
   $('procs').innerHTML = procs.length
