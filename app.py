@@ -74,6 +74,14 @@ if JELLYFIN_FALLBACK not in ("vaapi", "none"):
 # router serves still loads and unloads, but is never printed. Empty lists all.
 LLAMA_PUBLIC_MODELS = [m.strip().lower() for m in os.environ.get("LLAMA_PUBLIC_MODELS", "").split(",") if m.strip()]
 
+# Cards the node is supposed to have. A P100 that does not initialise is not an
+# error anywhere else: nvidia-smi simply lists one card less. 0 = the panel
+# reports what it sees and calls nothing missing.
+try:
+    GPU_EXPECTED = int(os.environ.get("GPU_EXPECTED", "0") or 0)
+except ValueError:
+    raise RuntimeError(f"GPU_EXPECTED must be a number, not {os.environ.get('GPU_EXPECTED')!r}")
+
 IMMICH_ML = "immich_machine_learning"
 GPU_FIELDS = (
     "index,uuid,name,driver_version,memory.used,memory.total,utilization.gpu,temperature.gpu,"
@@ -92,7 +100,10 @@ IMMICH_CFG_SCRIPT = r"""docker exec immich_postgres sh -c 'psql -U "$POSTGRES_US
 
 # comfy_idle_min: with an empty queue and an idle card, the P100 goes back to
 # llama.cpp by itself. 0 disables the timer.
-DEFAULTS = {"enabled": True, "llama_idle_min": 60, "ml_idle_min": 0, "comfy_idle_min": 10, "last_action": None, "last_action_at": None, "revoked": {}, "jellyfin_before_llm": None}
+#
+# gpus_known is the baseline the inventory is compared against, gpus_names keeps
+# the names of cards that have since disappeared.
+DEFAULTS = {"enabled": True, "llama_idle_min": 60, "ml_idle_min": 0, "comfy_idle_min": 10, "last_action": None, "last_action_at": None, "revoked": {}, "jellyfin_before_llm": None, "gpus_known": None, "gpus_names": {}, "gpus_last_change": None}
 
 # Derived from the credentials: rotating either one logs every browser out.
 SESSION_KEY = hashlib.sha256(f"session|{PANEL_PASSWORD}|{PANEL_TOKEN}".encode()).digest()
@@ -470,10 +481,73 @@ def record_action(text):
     save_state()
 
 
+def _short(uuid):
+    """The part of a PCI UUID that tells two identical cards apart."""
+    return uuid[4:12] if len(uuid) > 12 else uuid
+
+
+def track_gpus(gpus):
+    """Remember the card set, and record the moment it changes.
+
+    A card that fails to initialise is silent: no driver error reaches the
+    panel, `nvidia-smi` just answers with one card fewer, and every consumer on
+    the remaining card still works. Comparing UUIDs with the previous look is
+    what turns that silence into an event with a timestamp.
+
+    The first observation after a fresh state file is the baseline, not news.
+    """
+    uuids = [g["uuid"] for g in gpus]
+    names = {g["uuid"]: g.get("name", "GPU") for g in gpus}
+    known = state.get("gpus_known")
+    if known is None:
+        state["gpus_known"] = uuids
+        state["gpus_names"] = names
+        save_state()
+        return
+    if sorted(uuids) == sorted(known):
+        # Same cards, maybe reported in another order: not a change.
+        return
+    seen = dict(state.get("gpus_names") or {})
+    added = [{"uuid": u, "name": names[u]} for u in uuids if u not in known]
+    removed = [{"uuid": u, "name": seen.get(u, "GPU")} for u in known if u not in uuids]
+    state["gpus_known"] = uuids
+    state["gpus_names"] = {**{u: seen[u] for u in known if u in seen}, **names}
+    state["gpus_last_change"] = {
+        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "added": added,
+        "removed": removed,
+        "count": len(uuids),
+    }
+    parts = []
+    if added:
+        parts.append("%d new GPU: %s" % (len(added), ", ".join("%s (%s)" % (g["name"], _short(g["uuid"])) for g in added)))
+    if removed:
+        parts.append("%d GPU lost: %s" % (len(removed), ", ".join("%s (%s)" % (g["name"], _short(g["uuid"])) for g in removed)))
+    record_action("cards changed (now %d): %s" % (len(uuids), "; ".join(parts)))
+
+
+def inventory_view(gpus):
+    """What the dashboard needs to say whether the card set is complete."""
+    return {
+        "count": len(gpus),
+        "expected": GPU_EXPECTED,
+        "missing": max(0, GPU_EXPECTED - len(gpus)) if GPU_EXPECTED else 0,
+        "present": [
+            {"uuid": g["uuid"], "index": g.get("index"), "name": g.get("name")}
+            for g in gpus
+        ],
+        "last_change": state.get("gpus_last_change"),
+    }
+
+
 # --- auto switch ---
 def auto_tick():
     global last_busy, llm_blocked
-    util = int(gpu_status()["util_max"])
+    gpu = gpu_status()
+    # Before the switch logic and whatever it decides: the inventory has to be
+    # kept even when the auto mode is off.
+    track_gpus(gpu["gpus"])
+    util = int(gpu["util_max"])
     busy_samples.append(util)
     if util > 0:
         last_busy = time.time()
@@ -613,6 +687,10 @@ def session_info(request: Request):
 def status(_: str = Depends(require_auth)):
     gpu = gpu_status()
     out = {"gpu": gpu, "gpus": gpu.pop("gpus"), "auto": auto_snapshot()}
+    # A page load is also an observation: the set is compared here, not only on
+    # the 20-second tick, so a card that just came back shows up at once.
+    track_gpus(out["gpus"])
+    out["inventory"] = inventory_view(out["gpus"])
     for key, fn in (
         ("immich_ml", immich_ml_state),
         ("immich_ffmpeg", immich_transcode),
