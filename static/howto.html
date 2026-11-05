@@ -10,7 +10,7 @@
 <header>
   <span class="dot" id="dot"></span>
   <h1 id="host">GPU Control · how to use</h1>
-  <span class="sub">one P100, four consumers</span>
+  <span class="sub">one card, several consumers</span>
   <button id="logout" title="End this browser's session">Sign out</button>
 </header>
 <div class="shell">
@@ -32,11 +32,13 @@
 <h2 id="idea">The idea</h2>
 <div class="card">
   <div class="k">
-    The Tesla P100 has 16 GB and there are four things that want it: <b>llama.cpp</b>
-    (LLMs, ~15.8 GB with a large model resident), <b>Immich ML</b> (CUDA, ~6.8 GB),
-    <b>Jellyfin NVENC</b> (video transcoding) and <b>ComfyUI</b> (image generation,
-    ~4-6 GB). Only one of the first three can own the card at a time, so the panel
-    arbitrates: it watches what is really running and moves the others out of the way.
+    One card, several things that want it: <b>llama.cpp</b> (LLMs, a large one takes
+    the whole card), <b>Immich ML</b> (CUDA, it cannot share), <b>Jellyfin NVENC</b>
+    (video transcoding) and <b>ComfyUI</b> (image generation). Only one of the first
+    three can own the card at a time, so the panel arbitrates: it watches what is
+    really running and moves the others out of the way. A deployment without some of
+    them still works — the panel marks the missing consumer <b>not configured</b> and
+    leaves its controls disabled.
   </div>
   <div class="k" style="margin-top:8px">
     Two rules decide everything: <b>llama.cpp comes first</b> (while a model is
@@ -46,7 +48,7 @@
   <div class="k" style="margin-top:8px">
     A third rule is about the cards themselves: the panel remembers which ones it
     has seen by UUID. If <b>nvidia-smi answers with fewer cards than expected</b>
-    the dashboard says so at the top, because a P100 that does not initialise is
+    the dashboard says so at the top, because a card that does not initialise is
     silent everywhere else — and a card that comes back is recorded with the
     moment it did.
   </div>
@@ -60,13 +62,13 @@
       <tr>
         <td><b>LLM</b></td>
         <td>Unloads nothing by itself, stops <b>Immich ML</b> and moves Jellyfin to the
-            <b>iGPU</b> (VAAPI), so the P100 belongs to llama.cpp.</td>
+            the <b>integrated GPU</b> (VAAPI), so the card belongs to llama.cpp.</td>
         <td>Chatting with the agent, coding models, long prompts.</td>
       </tr>
       <tr>
         <td><b>Media</b></td>
         <td>Unloads the llama.cpp models, starts Immich ML and puts Jellyfin on
-            <b>NVENC</b> (the P100).</td>
+            <b>NVENC</b> (the card).</td>
         <td>Smart search / face detection batches, 4K transcoding.</td>
       </tr>
       <tr>
@@ -76,7 +78,7 @@
       </tr>
       <tr>
         <td><b>Image</b></td>
-        <td>Unloads the LLM, stops Immich ML, moves Jellyfin to the iGPU and
+        <td>Unloads the LLM, stops Immich ML, moves Jellyfin to the integrated GPU and
             <b>starts ComfyUI</b>.</td>
         <td>Generating images. A diffusion model needs the whole card.</td>
       </tr>
@@ -102,7 +104,7 @@
       <tr><td>Stop Immich ML (<span class="mono">ml_idle_min</span>)</td>
           <td>Immich ML is stopped when its own job queue is empty (it does not kill a
               running batch).</td></tr>
-      <tr><td>Release the P100 from ComfyUI (<span class="mono">comfy_idle_min</span>)</td>
+      <tr><td>Release the card from ComfyUI (<span class="mono">comfy_idle_min</span>)</td>
           <td>ComfyUI is stopped once its queue is empty, so the next LLM request finds
               the card free. This is why Image mode does not need to be undone by hand.</td></tr>
     </tbody>
@@ -151,9 +153,10 @@
 <h2 id="jellyfin">Jellyfin</h2>
 <div class="card">
   <div class="k">
-    <b>NVENC</b> transcodes on the <b>P100</b>; <b>VAAPI</b> on the <b>Intel iGPU</b>
-    (a different device, it costs the P100 nothing). When the LLM takes the card,
-    Jellyfin is moved to VAAPI, never to CPU: transcoding stays hardware-accelerated.
+    <b>NVENC</b> transcodes on the <b>discrete card</b>; <b>VAAPI</b> on the
+    <b>integrated GPU</b> (a different device, it costs the card nothing). When the
+    LLM takes the card, Jellyfin is moved to VAAPI, never to CPU: transcoding stays
+    hardware-accelerated.
   </div>
   <div class="k" style="margin-top:8px">
     Pick NVENC only when the card is free (Media mode). If playback starts stuttering
@@ -164,8 +167,9 @@
 <h2 id="logs">llama.cpp logs</h2>
 <div class="card">
   <div class="k">
-    A tail of the <span class="mono">llama-server</span> systemd unit on the AI
-    container (journald, read through the PVE host). What matters:
+    A tail of the <span class="mono">llama-server</span> systemd unit where it runs
+    (journald, read over SSH — inside a Proxmox container when
+    <span class="mono">AI_CTID</span> is set). What matters:
   </div>
   <div class="k" style="margin-top:8px">
     <span class="mono">load time = … ms</span> → how long the model took to come up
@@ -181,11 +185,12 @@
 <h2 id="power">Power limit</h2>
 <div class="card">
   <div class="k">
-    The P100 is tuned to <b>165 W</b> (application clock 1328 MHz): 99 % of its
-    throughput at 92 % of the power. Below ~142 W the clock never reaches 1328 MHz,
-    and above ~200 W nothing changes in real inference. Raising it is only worth it
-    for a long sustained prefill; lowering it to 125 W gives ~91 % of the speed.
-    The limit is applied by the PVE host (an unprivileged container cannot set it).
+    The slider only offers what the card reports as its own range, and the limit is
+    applied where the cards live (<span class="mono">GPU_HOST</span>), never from
+    inside the panel's container. On a P100 the useful band is narrow: ~165 W
+    (application clock 1328 MHz) gives 99 % of the throughput at 92 % of the power,
+    above ~200 W nothing changes in real inference, and at 125 W it is still ~91 % of
+    the speed. Measure before keeping a value: the card, not the panel, decides.
   </div>
 </div>
 

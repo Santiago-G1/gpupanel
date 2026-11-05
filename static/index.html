@@ -51,7 +51,7 @@
         <input type="number" id="llm-idle" min="0" max="1440" style="width:72px"> min idle</label>
       <label class="k">Stop Immich ML after
         <input type="number" id="ml-idle" min="0" max="1440" style="width:72px"> min (0 = off)</label>
-      <label class="k">Release the P100 from ComfyUI after
+      <label class="k">Release the card from ComfyUI after
         <input type="number" id="comfy-idle" min="0" max="1440" style="width:72px"> min idle</label>
       <button class="pri" id="auto-save">Save</button>
     </div>
@@ -120,12 +120,12 @@
   <div class="card">
     <div class="k">Current hardware acceleration: <b id="jf-accel" class="mono">—</b></div>
     <div class="k" style="margin-top:6px">
-      NVENC runs on the P100, VAAPI on the Intel iGPU.
+      NVENC uses the discrete card, VAAPI the integrated one.
       <a href="/howto#jellyfin">Which one to pick →</a>
     </div>
     <div class="row" id="jf" style="margin-top:10px">
-      <button class="on" data-accel="nvenc">NVIDIA NVENC · P100</button>
-      <button data-accel="vaapi">VAAPI · Intel iGPU</button>
+      <button class="on" data-accel="nvenc">NVIDIA NVENC · the card</button>
+      <button data-accel="vaapi">VAAPI · integrated GPU</button>
       <button class="warn" data-accel="none">CPU (no acceleration)</button>
     </div>
   </div>
@@ -146,7 +146,7 @@
     </div>
     <pre id="log-out" class="mono">loading…</pre>
     <div class="k" style="margin-top:8px">
-      <b>llama-server</b> journal on the AI container. Amber = warning, red = error.
+      <b id="log-unit-name">llama-server</b> journal on the AI host. Amber = warning, red = error.
       <a href="/howto#logs">What to look for →</a>
     </div>
   </div>
@@ -164,16 +164,16 @@ $('host').textContent = location.hostname + ' · GPU Control';
 document.title = location.hostname + ' · GPU Control';
 
 const MODES = {
-  llm: 'LLM (P100 for llama.cpp)',
+  llm: 'LLM (the card is llama.cpp\'s)',
   media: 'Media (Immich ML + Jellyfin NVENC)',
-  balanced: 'Shared (LLM + media on the P100)',
-  image: 'Image (ComfyUI on the P100)',
-  igpu: 'Media with Jellyfin on the iGPU',
+  balanced: 'Shared (LLM + media on the card)',
+  image: 'Image (ComfyUI on the card)',
+  igpu: 'Media with Jellyfin on the integrated GPU',
+  idle: 'Idle (nothing loaded)',
   mixed: 'mixed / transitioning',
 };
 
-// The P100 is the arbitrated card; VAAPI runs on the Intel iGPU.
-const DEVICES = {nvenc: 'P100 (NVENC)', vaapi: 'iGPU (VAAPI)', none: 'CPU'};
+const DEVICES = {nvenc: 'GPU (NVENC)', vaapi: 'integrated GPU (VAAPI)', none: 'CPU'};
 const str = (v) => (typeof v === 'string' ? v : '');
 const deviceLabel = (a) => DEVICES[a] || a || '—';
 
@@ -279,14 +279,27 @@ function deriveMode(s) {
   const ml = str(s.immich_ml);
   const jf = str(s.jellyfin_accel);
   const loaded = llamaCounts(s).loaded;
-  // "LLM": the P100 belongs to llama.cpp; Immich ML (CUDA) is the only other
-  // consumer that has to stop.
+  // A deployment without Immich or Jellyfin has nothing to arbitrate but the
+  // models: the card is llama.cpp's while something is loaded.
+  if (ml === 'unconfigured' && jf === 'unconfigured') return loaded ? 'llm' : 'idle';
+  // "LLM": the card belongs to llama.cpp; Immich ML (CUDA) is the only other
+  // consumer that has to stop for it.
   if (ml === 'exited' || ml === 'created' || ml === 'paused') return 'llm';
   if (ml === 'running') return jf === 'nvenc' ? (loaded ? 'balanced' : 'media') : 'igpu';
   return 'mixed';
 }
 
+// Disabled for a consumer that is not configured, in the same pass that decides
+// the rest of the state.
+function unavailable(sel, off) {
+  document.querySelectorAll(sel).forEach((b) => {
+    b.disabled = !!off;
+    b.title = off ? 'Not configured in this deployment' : '';
+  });
+}
+
 function paintState(s) {
+  const cfg = s.configured || {};
   const mode = deriveMode(s);
   pressed('#modes button', (d) => d.mode === mode);
   const now = $('mode-now');
@@ -300,6 +313,10 @@ function paintState(s) {
   const running = ml === 'running';
   const stopped = !!ml && ml !== 'unknown' && !running;
   pressed('#ml button', (d) => (d.ml === 'start' && running) || (d.ml === 'stop' && stopped));
+  // A consumer this deployment does not have: its controls make no sense.
+  unavailable('#ml button', !cfg.immich);
+  unavailable('#jf button', !cfg.jellyfin);
+  unavailable('#comfy button[data-comfy]', !cfg.comfyui);
 
   $('llama-unload').disabled = llamaCounts(s).loaded === 0;
 
@@ -404,9 +421,12 @@ async function refresh() {
   $('last-action').textContent =
     autoState.last_action ? `${autoState.last_action} (${autoState.last_action_at})` : '—';
   const jfDev = deviceLabel(str(s.jellyfin_accel));
-  $('llm-mode-state').textContent = autoState.llm_blocked
-    ? `LLM priority: Immich ML stopped (P100 for llama.cpp), Jellyfin on ${jfDev}`
-    : `media active: Immich ML on the P100, Jellyfin on ${jfDev}`;
+  const moved = [];
+  if (s.configured?.immich) moved.push(autoState.llm_blocked ? 'Immich ML stopped' : 'Immich ML on the card');
+  if (s.configured?.jellyfin) moved.push(`Jellyfin on ${jfDev}`);
+  $('llm-mode-state').textContent = moved.length
+    ? `${autoState.llm_blocked ? 'LLM priority' : 'media active'}: ${moved.join(', ')}`
+    : (autoState.llm_blocked ? 'LLM priority: the card is llama.cpp\'s' : 'nothing else configured');
 
   const llama = Array.isArray(s.llama) ? s.llama : [];
   const counts = llamaCounts(s);
@@ -419,18 +439,21 @@ async function refresh() {
 
   const ml = typeof s.immich_ml === 'string' ? s.immich_ml : (s.immich_ml?.error ? 'error' : '—');
   const mp = $('ml-pill');
-  mp.textContent = ml; mp.className = 'pill ' + (ml === 'running' ? 'ok' : 'off');
+  mp.textContent = ml === 'unconfigured' ? 'not configured' : ml;
+  mp.className = 'pill ' + (ml === 'unconfigured' ? '' : (ml === 'running' ? 'ok' : 'off'));
 
   const ff = s.immich_ffmpeg || {};
   $('imm-ff').textContent = ff.accel ? `${ff.accel} (${ff.preferredHwDevice || 'auto'})` : '—';
   const jfNow = str(s.jellyfin_accel);
-  $('jf-accel').textContent = jfNow ? `${jfNow} · ${deviceLabel(jfNow)}` : 'error';
+  $('jf-accel').textContent = jfNow === 'unconfigured'
+    ? 'not configured'
+    : (jfNow ? `${jfNow} · ${deviceLabel(jfNow)}` : 'error');
 
   const comfy = s.comfyui || {};
   const cState = str(comfy.state) || 'unknown';
   const cp = $('comfy-pill');
-  cp.textContent = cState;
-  cp.className = 'pill ' + (cState === 'running' ? 'ok' : 'off');
+  cp.textContent = cState === 'unconfigured' ? 'not configured' : cState;
+  cp.className = 'pill ' + (cState === 'unconfigured' ? '' : (cState === 'running' ? 'ok' : 'off'));
   pressed('#comfy button[data-comfy]', (d) => (d.comfy === 'start' && cState === 'running')
                                           || (d.comfy === 'stop' && cState !== 'running'));
   $('comfy-queue').textContent = typeof comfy.queue === 'number' ? comfy.queue + ' prompt(s)' : '—';
@@ -491,7 +514,7 @@ document.querySelectorAll('#comfy button[data-comfy]').forEach((b) => {
     if (action === 'start') {
       // A bare start would OOM the first load: the card has to be freed.
       return act(b, '/api/mode/image', null,
-        {pending: 'Freeing the P100 and starting ComfyUI…', done: 'Image mode: ComfyUI is up'});
+        {pending: 'Freeing the card and starting ComfyUI…', done: 'Image mode: ComfyUI is up'});
     }
     pressed('#comfy button[data-comfy]', (d) => d.comfy === action && action !== 'restart');
     act(b, '/api/comfy/' + action, null,
@@ -553,7 +576,8 @@ async function loadLogs() {
   startRequest();
   try {
     const r = await api('/api/llama/logs?lines=' + encodeURIComponent($('log-lines').value));
-    $('log-unit').textContent = r.unit + ' · CT ' + r.container + ' · ' + r.count + ' lines';
+    $('log-unit').textContent = [r.unit, r.host, r.ct ? 'CT ' + r.ct : null].filter(Boolean).join(' · ')
+      + ' · ' + r.count + ' lines';
     paintLogs((r.lines || []).join('\n') || '(no output)');
   } catch (e) {
     paintLogs('Error: ' + e.message);
