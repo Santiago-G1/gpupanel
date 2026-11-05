@@ -87,7 +87,9 @@ GPU_HOST = required("GPU_HOST", "PVE_HOST")
 # The llama.cpp router. The panel only speaks HTTP to it, so it can be anywhere
 # it can reach. A router started with `--api-key` (or behind a proxy that wants
 # one) needs `LLAMA_API_KEY`; nothing is sent when it is empty.
-LLAMA_URL = required("LLAMA_URL")
+# `.rstrip("/")`: a URL pasted from a browser ends with one, and `//v1/models` is
+# not what every router expects.
+LLAMA_URL = required("LLAMA_URL").rstrip("/")
 LLAMA_API_KEY = optional("LLAMA_API_KEY")
 LLAMA_HEADERS = {"Authorization": f"Bearer {LLAMA_API_KEY}"} if LLAMA_API_KEY else {}
 

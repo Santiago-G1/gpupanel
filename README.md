@@ -149,6 +149,26 @@ host.
 ansible-playbook playbooks/stacks.yml --limit ai -e '{"stacks_only":["gpu-panel"]}'
 ```
 
+## How the code is laid out
+
+`app.py` is one module on purpose: the panel is a single process that reads four
+things and moves them, and splitting it would put the probes and the switch
+logic in different namespaces for no gain. It is written in the order a request
+travels, and the section headers are the map:
+
+| Section | What lives there |
+| --- | --- |
+| Configuration | `required` / `optional` / `number`, every setting, and the `configured` flags |
+| State | `load_state` / `save_state` (atomic), `track_gpus`, `inventory_view`, `record_action` |
+| Auth | the signed cookie, the bearer token, the same-origin check for writes |
+| Probes | `run` / `ssh` / `ai_cmd` / `llama_request`, `gpu_status`, one function per consumer |
+| Auto-switch | `auto_tick` (the 20 s loop) and `comfy_release` |
+| Routes | the three pages, then `/api/*` |
+
+What is *not* here: a plugin interface for consumers, a database, a task queue or
+a template engine. The dashboard is three static pages that talk to `/api/status`
+and nothing else, which is why it can be published as-is.
+
 ## Development
 
 ```sh

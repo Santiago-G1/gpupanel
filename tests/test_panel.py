@@ -262,6 +262,24 @@ def test_unreachable_host_is_a_result_not_a_traceback(panel, monkeypatch):
 
 
 # --- talking to the router ---------------------------------------------------
+def test_a_trailing_slash_in_the_router_url_is_harmless(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, LLAMA_URL="http://llama.test:8080/")
+    seen = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"data": []}
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(panel.httpx, "request", lambda method, url, **kw: seen.append(url) or Response())
+    panel.llama_models()
+    assert seen == ["http://llama.test:8080/v1/models"]
+
+
 def test_router_auth_is_optional(panel, monkeypatch):
     seen = []
 
