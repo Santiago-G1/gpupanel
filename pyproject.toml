@@ -1,0 +1,19 @@
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "UP"]
+# E501: the formatter decides where lines end, and a long URL in a comment is
+# better than a broken one. B008: `Depends(...)` in a signature is the FastAPI
+# pattern, not a mistake.
+ignore = ["E501", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests reach into the module on purpose: they are the only callers of half of it.
+"tests/*" = ["B011"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
