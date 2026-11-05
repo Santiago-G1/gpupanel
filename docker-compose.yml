@@ -1,0 +1,38 @@
+services:
+  gpu-panel:
+    build: .
+    image: gpu-panel:local
+    container_name: gpu-panel
+    restart: unless-stopped
+    ports:
+      - "${PUBLISH_PORT:?}:8099"
+    environment:
+      - TZ=${TZ:-Etc/UTC}
+      - PANEL_USER=${PANEL_USER:-admin}
+      - PANEL_PASSWORD=${PANEL_PASSWORD:?PANEL_PASSWORD is required}
+      - PANEL_TOKEN=${PANEL_TOKEN:?PANEL_TOKEN is required}
+      # Values come from the rendered .env, never from this file.
+      - LLAMA_PUBLIC_MODELS=${LLAMA_PUBLIC_MODELS:-}
+      # Required: the panel's own localhost is not llama.cpp.
+      - LLAMA_URL=${LLAMA_URL:?LLAMA_URL is required}
+      - PVE_HOST=${PVE_HOST:?PVE_HOST is required}
+      - IMMICH_HOST=${IMMICH_HOST:?IMMICH_HOST is required}
+      - FRONTEND_HOST=${FRONTEND_HOST:?FRONTEND_HOST is required}
+      # Jellyfin's config on that host, read over the same SSH.
+      - JELLYFIN_XML=${JELLYFIN_XML:?JELLYFIN_XML is required}
+      # The AI container, entered by its Proxmox VM ID, holds the unit's logs.
+      - AI_CTID=${AI_CTID:?AI_CTID is required}
+      - LLAMA_LOG_UNIT=${LLAMA_LOG_UNIT:-llama-server}
+      - JELLYFIN_FALLBACK=${JELLYFIN_FALLBACK:-vaapi}
+      # COMFY_URL is the LAN address: in its own container 127.0.0.1 is itself.
+      - COMFY_URL=${COMFY_URL:-}
+      - COMFY_UI_URL=${COMFY_UI_URL:-}
+      - COMFY_CONTAINER=${COMFY_CONTAINER:-comfyui}
+    volumes:
+      # The key that reaches the PVE host and the other GPU consumers.
+      - /root/.ssh:/root/.ssh:ro
+      # Auto-switch settings survive a recreate.
+      - gpu_panel_state:/state
+
+volumes:
+  gpu_panel_state:
