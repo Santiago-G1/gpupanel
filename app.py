@@ -66,6 +66,19 @@ def number(name, default, cast=int):
         raise RuntimeError(f"{name} must be a number, not {raw!r}")
 
 
+def as_number(value, default=0.0):
+    """A reading from nvidia-smi, or a default.
+
+    Every field the tool queries can answer `N/A`: a card that does not report a
+    power limit, a `utilization.gpu` with no driver support, a virtualised GPU.
+    Those are not zero and must not become a traceback either.
+    """
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 # --- the cards, and the model server on them ---
 # Any SSH target where nvidia-smi answers: no Proxmox, no specific distro. The
 # old name of this variable still works.
@@ -268,7 +281,17 @@ def require_auth(request: Request) -> str:
 
 # --- helpers ---
 def run(cmd, timeout=30, **kwargs):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kwargs)
+    """A command, with its timeout and its missing binary turned into a result.
+
+    Every caller checks `returncode` and reports its stderr, which is a far more
+    useful answer than a 500 from an unreachable host.
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kwargs)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {timeout}s")
+    except OSError as exc:
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
 
 def ssh(host, command, timeout=30):
@@ -324,8 +347,9 @@ def gpu_status():
             target["processes"].append(proc)
 
     gpu = gpus[0]
-    # A card is busy if any card is busy.
-    gpu["util_max"] = max(int(g["util"]) for g in gpus)
+    # A card is busy if any card is busy. `N/A` counts as idle here: nothing is
+    # being computed, and it must not be read as a number.
+    gpu["util_max"] = max(int(as_number(g["util"])) for g in gpus)
     gpu["power_limits"] = [g["power_limit"] for g in gpus]
     gpu["gpus"] = gpus
     return gpu
@@ -560,8 +584,16 @@ def record_action(text):
 
 
 def _short(uuid):
-    """The part of a PCI UUID that tells two identical cards apart."""
-    return uuid[4:12] if len(uuid) > 12 else uuid
+    """The part of a PCI UUID that tells two identical cards apart.
+
+    A PCI UUID is `GPU-<serial>-<more>`, but a MIG device is `MIG-<parent>-...`
+    and the serial is not always the same length: cut at the dash instead of at
+    a fixed offset, which used to leave `bbbb-222` in a message.
+    """
+    text = str(uuid)
+    parts = text.split("-")
+    serial = parts[1] if len(parts) > 1 else text
+    return serial[:12] or text
 
 
 def track_gpus(gpus):
@@ -625,7 +657,7 @@ def auto_tick():
     # Before the switch logic and whatever it decides: the inventory has to be
     # kept even when the auto mode is off.
     track_gpus(gpu["gpus"])
-    util = int(gpu["util_max"])
+    util = gpu["util_max"]
     busy_samples.append(util)
     if util > 0:
         last_busy = time.time()
@@ -900,11 +932,12 @@ def set_power(body: dict = Body(...), _: str = Depends(require_auth)):
     except (TypeError, ValueError):
         raise HTTPException(400, "watts must be an integer")
     # The range is the card's, not a constant: a P100 allows 125-250 W and
-    # anything else reports its own limits.
+    # anything else reports its own limits. A card that reports neither (or
+    # answers `N/A`) is left to nvidia-smi, whose refusal is the honest answer.
     card = gpu_status()
-    low, high = int(float(card["power_min"])), int(float(card["power_max"]))
-    if not low <= watts <= high:
-        raise HTTPException(400, f"watts must be between {low} and {high}")
+    low, high = as_number(card["power_min"], None), as_number(card["power_max"], None)
+    if low is not None and high is not None and not low <= watts <= high:
+        raise HTTPException(400, f"watts must be between {int(low)} and {int(high)}")
     p = ssh(GPU_HOST, f"nvidia-smi -pl {watts}")
     if p.returncode != 0:
         raise HTTPException(502, p.stderr.strip() or p.stdout.strip())
