@@ -25,15 +25,28 @@ from fastapi.staticfiles import StaticFiles
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
+def required(name):
+    """A variable the panel cannot work without, named when it is missing.
+
+    Compose only reports that the container exited, so the traceback has to say
+    which variable was empty.
+    """
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} is required and must not be empty")
+    return value
+
+
 # Required from the environment: this file never carries the lab's addresses.
-PVE_HOST = os.environ["PVE_HOST"]
-IMMICH_HOST = os.environ["IMMICH_HOST"]
-FRONTEND_HOST = os.environ["FRONTEND_HOST"]
-LLAMA_URL = os.environ["LLAMA_URL"]
+PVE_HOST = required("PVE_HOST")
+IMMICH_HOST = required("IMMICH_HOST")
+FRONTEND_HOST = required("FRONTEND_HOST")
+LLAMA_URL = required("LLAMA_URL")
 # llama-server is a systemd unit, so its logs are read over SSH to the PVE node.
-AI_CTID = os.environ["AI_CTID"]
+AI_CTID = required("AI_CTID")
 # Jellyfin's encoding.xml on the frontend host, read and rewritten over SSH.
-JELLYFIN_XML = os.environ["JELLYFIN_XML"]
+JELLYFIN_XML = required("JELLYFIN_XML")
 LLAMA_LOG_UNIT = os.environ.get("LLAMA_LOG_UNIT", "llama-server")
 LLAMA_LOG_MAX = 2000
 # On-demand stack: started here, stopped when the card goes back to llama.cpp.
