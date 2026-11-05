@@ -1,6 +1,6 @@
-# GPU control panel: arbitrates the single P100 between llama.cpp, Immich ML,
-# Jellyfin and ComfyUI. It reaches every one of them over SSH to the host that
-# owns it, so the SSH key is the mount that matters.
+# GPU control panel: arbitrates one card (or several) between llama.cpp and
+# whatever else wants it. Everything it drives is reached over SSH, so the key
+# is the mount that matters — the rest is settings.
 services:
   gpu-panel:
     build: .
@@ -13,30 +13,40 @@ services:
       - "${PUBLISH_PORT:?}:8099"
     environment:
       - TZ=${TZ:-Etc/UTC}
+      # Required: where nvidia-smi answers, and the router that loads models.
+      - GPU_HOST=${GPU_HOST:?GPU_HOST is required}
+      - LLAMA_URL=${LLAMA_URL:?LLAMA_URL is required}
+      # Required: they sign the session cookie.
       - PANEL_USER=${PANEL_USER:-admin}
       - PANEL_PASSWORD=${PANEL_PASSWORD:?PANEL_PASSWORD is required}
       - PANEL_TOKEN=${PANEL_TOKEN:?PANEL_TOKEN is required}
-      # Values come from the rendered .env, never from this file.
+      # llama.cpp and ComfyUI: the host they run on, and optionally the Proxmox
+      # CT to enter there. Empty AI_CTID means they run on the host itself.
+      - AI_HOST=${AI_HOST:-}
+      - AI_CTID=${AI_CTID:-}
+      - LLAMA_LOG_UNIT=${LLAMA_LOG_UNIT:-llama-server}
+      # Optional display filter: only these model ids are ever named.
       - LLAMA_PUBLIC_MODELS=${LLAMA_PUBLIC_MODELS:-}
       # How many cards the node should have: 0 reports without judging.
       - GPU_EXPECTED=${GPU_EXPECTED:-0}
-      # Required: the panel's own localhost is not llama.cpp.
-      - LLAMA_URL=${LLAMA_URL:?LLAMA_URL is required}
-      - PVE_HOST=${PVE_HOST:?PVE_HOST is required}
-      - IMMICH_HOST=${IMMICH_HOST:?IMMICH_HOST is required}
-      - FRONTEND_HOST=${FRONTEND_HOST:?FRONTEND_HOST is required}
-      # Jellyfin's config on that host, read over the same SSH.
-      - JELLYFIN_XML=${JELLYFIN_XML:?JELLYFIN_XML is required}
-      # The AI container, entered by its Proxmox VM ID, holds the unit's logs.
-      - AI_CTID=${AI_CTID:?AI_CTID is required}
-      - LLAMA_LOG_UNIT=${LLAMA_LOG_UNIT:-llama-server}
+      # Consumers. Empty means "not configured": the panel says so and leaves
+      # that part of the card alone.
+      - IMMICH_HOST=${IMMICH_HOST:-}
+      - IMMICH_ML_CONTAINER=${IMMICH_ML_CONTAINER:-}
+      - IMMICH_PG_CONTAINER=${IMMICH_PG_CONTAINER:-}
+      - IMMICH_REDIS_CONTAINER=${IMMICH_REDIS_CONTAINER:-}
+      - IMMICH_QUEUE_PREFIX=${IMMICH_QUEUE_PREFIX:-}
+      - IMMICH_ML_QUEUES=${IMMICH_ML_QUEUES:-}
+      - JELLYFIN_HOST=${JELLYFIN_HOST:-}
+      - JELLYFIN_XML=${JELLYFIN_XML:-}
+      - JELLYFIN_CONTAINER=${JELLYFIN_CONTAINER:-}
       - JELLYFIN_FALLBACK=${JELLYFIN_FALLBACK:-vaapi}
+      - COMFY_CONTAINER=${COMFY_CONTAINER:-}
       # COMFY_URL is the LAN address: in its own container 127.0.0.1 is itself.
       - COMFY_URL=${COMFY_URL:-}
       - COMFY_UI_URL=${COMFY_UI_URL:-}
-      - COMFY_CONTAINER=${COMFY_CONTAINER:-comfyui}
     volumes:
-      # The key that reaches the PVE host and the other GPU consumers.
+      # The key that reaches the hosts this panel drives.
       - /root/.ssh:/root/.ssh:ro
       # Auto-switch settings survive a recreate.
       - gpu_panel_state:/state
@@ -45,7 +55,7 @@ services:
         limits:
           cpus: "1"
           memory: 512M
-    # /api/session answers without credentials and never touches the PVE node,
+    # /api/session answers without credentials and never touches another host,
     # which makes it the cheapest probe of the process itself.
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/api/session', timeout=5)"]
