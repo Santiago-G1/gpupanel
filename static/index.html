@@ -27,6 +27,7 @@
 </nav>
 <main>
   <h2>Cards</h2>
+  <div class="card" id="gpu-alert" style="display:none"></div>
   <div id="gpu-cards"></div>
 
   <h2>Power limit</h2>
@@ -322,6 +323,39 @@ function syncPower() {
   btn.title = same ? 'The current limit is already ' + watts + ' W' : '';
 }
 
+// The card set is the one thing nvidia-smi is silent about: a card that does
+// not initialise is a card fewer, not an error. This is where that shows.
+function renderInventory(inv) {
+  const box = $('gpu-alert');
+  const lc = inv.last_change || null;
+  const count = inv.count || 0;
+  const expected = inv.expected || 0;
+  const missing = inv.missing || 0;
+  const label = (g) => `${g.name} <span class="mono">${String(g.uuid || '').slice(4, 12)}</span>`;
+  let html = '';
+  if (missing > 0) {
+    html = `<span class="pill off">${count} of ${expected}</span>
+      <b style="color:var(--fg)">${missing} card${missing > 1 ? 's' : ''} missing</b>
+      <div class="k" style="margin-top:8px">
+        nvidia-smi answers with ${count} card${count === 1 ? '' : 's'}, so one is not
+        initialising: the panel cannot fix that. Check the card after the last
+        kernel update and reload the driver.
+      </div>`;
+  } else if (lc && (lc.added || []).length) {
+    html = `<span class="pill ok">new card</span>
+      <b style="color:var(--fg)">${lc.added.map(label).join(', ')}</b>
+      <span class="k">came up ${lc.at}${expected ? ` — ${count} of ${expected} now` : ''}</span>`;
+  } else if (expected) {
+    html = `<span class="pill ok">${count} of ${expected}</span>
+      <span class="k">cards answering${lc ? ` · last change ${lc.at}` : ''}</span>`;
+  } else if (lc) {
+    html = `<span class="pill acc">${count}</span>
+      <span class="k">cards · last change ${lc.at}</span>`;
+  }
+  box.style.display = html ? '' : 'none';
+  box.innerHTML = html;
+}
+
 async function refresh() {
   let s;
   try { s = await api('/api/status'); }
@@ -329,6 +363,7 @@ async function refresh() {
   last = s;
   const g = s.gpu || {};
   const gpus = Array.isArray(s.gpus) && s.gpus.length ? s.gpus : [g];
+  renderInventory(s.inventory || {});
   $('gpu-name').textContent = gpus.length > 1
     ? `${gpus.length} × ${g.name} · driver ${g.driver}`
     : `${g.name} · driver ${g.driver}`;
