@@ -27,7 +27,7 @@ host and the router: see [Adapting it to your setup](#adapting-it-to-your-setup)
 | --- | --- |
 | Docker with Compose v2 | the only runtime dependency; nothing is installed on the hosts |
 | `nvidia-smi` on `GPU_HOST`, over SSH with a key | the cards, their processes and the power limit |
-| A llama.cpp router (`/v1/models`, `/models/unload`) | llama.cpp in router mode or llama-swap |
+| A llama.cpp router (`/v1/models`, `/models/unload`) | llama.cpp in router mode or llama-swap; `LLAMA_API_KEY` if it wants a key |
 | SSH to the consumers' hosts | `docker` there for Immich, a file rewrite for Jellyfin, `pct exec` only with `AI_CTID` |
 | journald on `AI_HOST` | only for the log tail endpoint |
 

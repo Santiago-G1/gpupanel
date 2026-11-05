@@ -261,6 +261,56 @@ def test_unreachable_host_is_a_result_not_a_traceback(panel, monkeypatch):
     assert panel.run(["ssh"]).returncode == 127
 
 
+# --- talking to the router ---------------------------------------------------
+def test_router_auth_is_optional(panel, monkeypatch):
+    seen = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"data": [{"id": "m", "status": {"value": "loaded"}}]}
+
+        def raise_for_status(self):
+            return None
+
+    def fake_request(method, url, **kwargs):
+        seen.append((method, url, kwargs.get("headers") or {}))
+        return Response()
+
+    monkeypatch.setattr(panel.httpx, "request", fake_request)
+    assert panel.llama_models()[0]["id"] == "m"
+    assert seen[0][2] == {}  # no key configured, no header
+
+    panel.LLAMA_HEADERS.clear()
+    panel.LLAMA_HEADERS.update({"Authorization": "Bearer secret"})
+    panel.llama_models()
+    assert seen[1][2] == {"Authorization": "Bearer secret"}
+
+
+def test_the_key_reaches_the_unload_call(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, LLAMA_API_KEY="secret")
+    seen = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"data": [{"id": "big", "status": {"value": "loaded"}}]}
+
+        def raise_for_status(self):
+            return None
+
+    def fake_request(method, url, **kwargs):
+        seen.append((method, url, kwargs.get("headers") or {}, kwargs.get("json")))
+        return Response()
+
+    monkeypatch.setattr(panel.httpx, "request", fake_request)
+    assert panel.llama_unload_all() == [{"model": "big", "http": 200}]
+    assert seen[-1] == ("POST", "http://llama.test:8080/models/unload",
+                        {"Authorization": "Bearer secret"}, {"model": "big"})
+
+
 # --- inventory --------------------------------------------------------------
 def test_inventory_tracks_the_card_set(panel, tmp_path):
     a = {"uuid": "GPU-aaaa-1111", "name": "Card A", "index": "0"}

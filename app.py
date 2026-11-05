@@ -85,8 +85,11 @@ def as_number(value, default=0.0):
 # old name of this variable still works.
 GPU_HOST = required("GPU_HOST", "PVE_HOST")
 # The llama.cpp router. The panel only speaks HTTP to it, so it can be anywhere
-# it can reach.
+# it can reach. A router started with `--api-key` (or behind a proxy that wants
+# one) needs `LLAMA_API_KEY`; nothing is sent when it is empty.
 LLAMA_URL = required("LLAMA_URL")
+LLAMA_API_KEY = optional("LLAMA_API_KEY")
+LLAMA_HEADERS = {"Authorization": f"Bearer {LLAMA_API_KEY}"} if LLAMA_API_KEY else {}
 
 # llama.cpp and ComfyUI: the machine they run on, and optionally the Proxmox CT
 # to enter there with `pct exec`. No CT id means they run on that host itself.
@@ -326,6 +329,12 @@ def run(cmd, timeout=30, **kwargs):
         return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
 
+def llama_request(method, path, **kwargs):
+    """A call to the router, with the key if one is configured."""
+    kwargs.setdefault("timeout", 8)
+    return httpx.request(method, f"{LLAMA_URL}{path}", headers=dict(LLAMA_HEADERS), **kwargs)
+
+
 def ssh(host, command, timeout=30):
     return run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", host, command], timeout)
 
@@ -388,7 +397,7 @@ def gpu_status():
 
 
 def llama_models():
-    r = httpx.get(f"{LLAMA_URL}/v1/models", timeout=8)
+    r = llama_request("GET", "/v1/models")
     r.raise_for_status()
     return [
         {"id": m.get("id"), "status": (m.get("status") or {}).get("value", "unknown")}
@@ -403,7 +412,7 @@ def llama_loaded():
 def llama_unload_all():
     out = []
     for m in llama_loaded():
-        r = httpx.post(f"{LLAMA_URL}/models/unload", json={"model": m["id"]}, timeout=60)
+        r = llama_request("POST", "/models/unload", json={"model": m["id"]}, timeout=60)
         out.append({"model": m["id"], "http": r.status_code})
     return out
 

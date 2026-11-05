@@ -16,6 +16,8 @@ services:
       # Required: where nvidia-smi answers, and the router that loads models.
       - GPU_HOST=${GPU_HOST:?GPU_HOST is required}
       - LLAMA_URL=${LLAMA_URL:?LLAMA_URL is required}
+      # Only for a router that was started with `--api-key`.
+      - LLAMA_API_KEY=${LLAMA_API_KEY:-}
       # Required: they sign the session cookie.
       - PANEL_USER=${PANEL_USER:-admin}
       - PANEL_PASSWORD=${PANEL_PASSWORD:?PANEL_PASSWORD is required}
