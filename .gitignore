@@ -1,0 +1,38 @@
+# CREDENTIALS AND SECRETS
+.env
+.env.*
+**/.env
+*.pem
+*.key
+*secret*
+*password*
+
+# Versionable templates (never a real secret)
+!.env.template
+
+# RUNTIME STATE
+# The `gpu_panel_state` volume keeps this inside Docker; these cover a manual
+# run from the repository.
+state/
+auto.json
+
+# PYTHON
+__pycache__/
+*.pyo
+*.pyc
+.venv/
+venv/
+
+# SYSTEM
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# LOGS AND TEMPORARIES
+*.log
+*.tmp
+*.bak

@@ -1,0 +1,11 @@
+# The image only needs the application: everything else is for the repository.
+.git
+.gitignore
+.dockerignore
+README.md
+.env
+.env.*
+*.md
+state/
+__pycache__/
+*.pyc
