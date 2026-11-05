@@ -1,7 +1,10 @@
-"""GPU control panel for the lab.
+"""GPU control panel: one card, several consumers, one owner at a time.
 
-Drives the Tesla P100 through the PVE node: that is where nvidia-smi and the
-power limit live, and where the SSH reach to the card's other consumers starts.
+The cards are read and driven over SSH (nvidia-smi, the power limit), and every
+consumer is a setting: llama.cpp over its HTTP router, Immich and Jellyfin and
+ComfyUI through the host that runs them. Nothing here is tied to a particular
+machine — only GPU_HOST and LLAMA_URL are required.
+
 Auth is a signed session cookie plus a bearer token for automation.
 """
 
@@ -26,63 +29,116 @@ from fastapi.staticfiles import StaticFiles
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def required(name):
-    """A variable the panel cannot work without, named when it is missing.
+def required(*names):
+    """The first of these variables that is set, or a message naming them all.
 
     Compose only reports that the container exited, so the traceback has to say
-    which variable was empty.
+    which variable was empty. More than one name covers a variable that was
+    renamed here: the old spelling keeps working.
     """
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise RuntimeError(f"{name} is required and must not be empty")
-    return value
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    raise RuntimeError(f"{' or '.join(names)} is required and must not be empty")
 
 
-# Required from the environment: this file never carries the lab's addresses.
-PVE_HOST = required("PVE_HOST")
-IMMICH_HOST = required("IMMICH_HOST")
-FRONTEND_HOST = required("FRONTEND_HOST")
+def optional(*names):
+    """The first of these variables that is set, or "" when none of them is.
+
+    An empty consumer is not an error: the panel reports it as not configured
+    and leaves that part of the card alone.
+    """
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def number(name, default, cast=int):
+    raw = optional(name)
+    if not raw:
+        return cast(default)
+    try:
+        return cast(raw)
+    except ValueError:
+        raise RuntimeError(f"{name} must be a number, not {raw!r}")
+
+
+# --- the cards, and the model server on them ---
+# Any SSH target where nvidia-smi answers: no Proxmox, no specific distro. The
+# old name of this variable still works.
+GPU_HOST = required("GPU_HOST", "PVE_HOST")
+# The llama.cpp router. The panel only speaks HTTP to it, so it can be anywhere
+# it can reach.
 LLAMA_URL = required("LLAMA_URL")
-# llama-server is a systemd unit, so its logs are read over SSH to the PVE node.
-AI_CTID = required("AI_CTID")
-# Jellyfin's encoding.xml on the frontend host, read and rewritten over SSH.
-JELLYFIN_XML = required("JELLYFIN_XML")
-LLAMA_LOG_UNIT = os.environ.get("LLAMA_LOG_UNIT", "llama-server")
+
+# llama.cpp and ComfyUI: the machine they run on, and optionally the Proxmox CT
+# to enter there with `pct exec`. No CT id means they run on that host itself.
+AI_HOST = optional("AI_HOST") or GPU_HOST
+AI_CTID = optional("AI_CTID")
+LLAMA_LOG_UNIT = optional("LLAMA_LOG_UNIT") or "llama-server"
 LLAMA_LOG_MAX = 2000
-# On-demand stack: started here, stopped when the card goes back to llama.cpp.
-COMFY_URL = os.environ.get("COMFY_URL", "")
-COMFY_UI_URL = os.environ.get("COMFY_UI_URL", "")
-COMFY_CONTAINER = os.environ.get("COMFY_CONTAINER", "comfyui")
-# Both are required: an empty password would leave the panel unloggable, and an
-# empty token would sign every session with the same predictable key.
-PANEL_USER = os.environ.get("PANEL_USER", "admin")
+
+# The panel's own credentials. Both are required: an empty password would leave
+# the panel unloggable, and an empty token would sign every session with a key
+# derived from it.
+PANEL_USER = optional("PANEL_USER") or "admin"
 PANEL_PASSWORD = required("PANEL_PASSWORD")
 PANEL_TOKEN = required("PANEL_TOKEN")
-SESSION_COOKIE = os.environ.get("SESSION_COOKIE", "panel_session")
-SESSION_TTL = int(os.environ.get("SESSION_TTL", 7 * 24 * 3600))
-LOGIN_DELAY = float(os.environ.get("LOGIN_DELAY", 0.4))
-STATE_PATH = os.environ.get("STATE_PATH", "/state/auto.json")
+SESSION_COOKIE = optional("SESSION_COOKIE") or "panel_session"
+SESSION_TTL = number("SESSION_TTL", 7 * 24 * 3600)
+LOGIN_DELAY = number("LOGIN_DELAY", 0.4, float)
+STATE_PATH = optional("STATE_PATH") or "/state/auto.json"
 
-# Jellyfin moves to the iGPU (VAAPI) when llama.cpp owns the P100: dropping to
-# CPU would lose hardware transcoding for nothing. `none` restores CPU.
-JELLYFIN_FALLBACK = os.environ.get("JELLYFIN_FALLBACK", "vaapi")
-JELLYFIN_DEVICES = {"nvenc": "P100 (NVENC)", "vaapi": "iGPU (VAAPI)", "none": "CPU"}
+# --- the consumers, each one optional ---
+# Immich. Its container names come from Immich itself and they have changed
+# between releases, so they are settings rather than constants.
+IMMICH_HOST = optional("IMMICH_HOST")
+IMMICH_ML_CONTAINER = optional("IMMICH_ML_CONTAINER") or "immich_machine_learning"
+IMMICH_PG_CONTAINER = optional("IMMICH_PG_CONTAINER") or "immich_postgres"
+IMMICH_REDIS_CONTAINER = optional("IMMICH_REDIS_CONTAINER") or "immich_redis"
+IMMICH_QUEUE_PREFIX = optional("IMMICH_QUEUE_PREFIX") or "immich_bull"
+# Queues that mean somebody is waiting for the ML container.
+IMMICH_ML_QUEUES = [q.strip() for q in (optional("IMMICH_ML_QUEUES") or "faceDetection,smartSearch,ocr").split(",") if q.strip()]
+
+# Jellyfin needs the host and the file it rewrites, or it is not there.
+JELLYFIN_HOST = optional("JELLYFIN_HOST", "FRONTEND_HOST")
+JELLYFIN_XML = optional("JELLYFIN_XML")
+JELLYFIN_CONTAINER = optional("JELLYFIN_CONTAINER") or "jellyfin"
+
+# ComfyUI: a container to start and stop, its API for the queue depth, or both.
+COMFY_CONTAINER = optional("COMFY_CONTAINER")
+COMFY_URL = optional("COMFY_URL")
+COMFY_UI_URL = optional("COMFY_UI_URL")
+
+# What this deployment actually has. The dashboard hides what is missing and the
+# switch logic never claims an action it did not take.
+IMMICH = bool(IMMICH_HOST)
+JELLYFIN = bool(JELLYFIN_HOST and JELLYFIN_XML)
+COMFY = bool(COMFY_CONTAINER)
+COMFY_API = bool(COMFY_URL)
+
+# Where Jellyfin transcodes while llama.cpp owns the card: the other GPU
+# (nvenc), the integrated one (vaapi) or the CPU (none).
+JELLYFIN_FALLBACK = optional("JELLYFIN_FALLBACK") or "vaapi"
+JELLYFIN_DEVICES = {"nvenc": "GPU (NVENC)", "vaapi": "integrated GPU (VAAPI)", "none": "CPU"}
 if JELLYFIN_FALLBACK not in ("vaapi", "none"):
     JELLYFIN_FALLBACK = "vaapi"
 
 # Models the dashboard may name (case-insensitive substrings). Anything else the
 # router serves still loads and unloads, but is never printed. Empty lists all.
-LLAMA_PUBLIC_MODELS = [m.strip().lower() for m in os.environ.get("LLAMA_PUBLIC_MODELS", "").split(",") if m.strip()]
+LLAMA_PUBLIC_MODELS = [m.strip().lower() for m in optional("LLAMA_PUBLIC_MODELS").split(",") if m.strip()]
 
-# Cards the node is supposed to have. A P100 that does not initialise is not an
+# Cards the node is supposed to have. A card that does not initialise is not an
 # error anywhere else: nvidia-smi simply lists one card less. 0 = the panel
 # reports what it sees and calls nothing missing.
-try:
-    GPU_EXPECTED = int(os.environ.get("GPU_EXPECTED", "0") or 0)
-except ValueError:
-    raise RuntimeError(f"GPU_EXPECTED must be a number, not {os.environ.get('GPU_EXPECTED')!r}")
+GPU_EXPECTED = number("GPU_EXPECTED", 0)
 
-IMMICH_ML = "immich_machine_learning"
+# Delivered base64: the psql quoting does not survive nested shells.
+IMMICH_CFG_SCRIPT = r"""docker exec %s sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "select value from system_metadata where key = '"'"'system-config'"'"';"'"""
+
 GPU_FIELDS = (
     "index,uuid,name,driver_version,memory.used,memory.total,utilization.gpu,temperature.gpu,"
     "power.draw,power.limit,power.default_limit,power.min_limit,power.max_limit,"
@@ -93,17 +149,14 @@ GPU_KEYS = [
     "power_draw", "power_limit", "power_default", "power_min", "power_max",
     "clk_sm", "clk_mem", "pcie_gen", "pcie_width",
 ]
-ML_QUEUES = ("faceDetection", "smartSearch", "ocr")
 
-# Delivered base64: the psql quoting does not survive nested shells.
-IMMICH_CFG_SCRIPT = r"""docker exec immich_postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "select value from system_metadata where key = '"'"'system-config'"'"';"'"""
-
-# comfy_idle_min: with an empty queue and an idle card, the P100 goes back to
+# comfy_idle_min: with an empty queue and an idle card, the GPU goes back to
 # llama.cpp by itself. 0 disables the timer.
 #
 # gpus_known is the baseline the inventory is compared against, gpus_names keeps
 # the names of cards that have since disappeared.
 DEFAULTS = {"enabled": True, "llama_idle_min": 60, "ml_idle_min": 0, "comfy_idle_min": 10, "last_action": None, "last_action_at": None, "revoked": {}, "jellyfin_before_llm": None, "gpus_known": None, "gpus_names": {}, "gpus_last_change": None}
+
 
 # Derived from the credentials: rotating either one logs every browser out.
 SESSION_KEY = hashlib.sha256(f"session|{PANEL_PASSWORD}|{PANEL_TOKEN}".encode()).digest()
@@ -222,6 +275,11 @@ def ssh(host, command, timeout=30):
     return run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", host, command], timeout)
 
 
+def ai_cmd(command):
+    """A command where llama.cpp and ComfyUI live: on AI_HOST, or in its CT."""
+    return f"pct exec {AI_CTID} -- {command}" if AI_CTID else command
+
+
 def ssh_script(host, script, timeout=60):
     payload = base64.b64encode(script.encode()).decode()
     return run(
@@ -237,7 +295,7 @@ def gpu_status():
     `gpu` stays GPU 0 for backwards compatibility and `gpus` carries the list.
     Processes are attributed by UUID: without that the second card looks idle.
     """
-    p = ssh(PVE_HOST, f"nvidia-smi --query-gpu={GPU_FIELDS} --format=csv,noheader,nounits")
+    p = ssh(GPU_HOST, f"nvidia-smi --query-gpu={GPU_FIELDS} --format=csv,noheader,nounits")
     if p.returncode != 0:
         raise HTTPException(502, f"nvidia-smi failed: {p.stderr.strip() or p.stdout.strip()}")
     gpus = []
@@ -251,7 +309,7 @@ def gpu_status():
     if not gpus:
         raise HTTPException(502, "nvidia-smi returned no GPUs")
 
-    pr = ssh(PVE_HOST,
+    pr = ssh(GPU_HOST,
              "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory "
              "--format=csv,noheader,nounits")
     by_uuid = {g["uuid"]: g for g in gpus}
@@ -301,8 +359,8 @@ def llama_logs(lines=200):
     except (TypeError, ValueError):
         raise HTTPException(400, "lines must be an integer")
     p = ssh(
-        PVE_HOST,
-        f"pct exec {AI_CTID} -- journalctl -u {LLAMA_LOG_UNIT} -n {lines} --no-pager -o short-iso",
+        AI_HOST,
+        ai_cmd(f"journalctl -u {LLAMA_LOG_UNIT} -n {lines} --no-pager -o short-iso"),
         timeout=25,
     )
     if p.returncode != 0:
@@ -328,20 +386,25 @@ def model_names(models):
 
 
 def immich_ml_state():
-    p = ssh(IMMICH_HOST, f"docker inspect -f '{{{{.State.Status}}}}' {IMMICH_ML}")
+    if not IMMICH:
+        return "unconfigured"
+    p = ssh(IMMICH_HOST, f"docker inspect -f '{{{{.State.Status}}}}' {IMMICH_ML_CONTAINER}")
     return p.stdout.strip() or "unknown"
 
 
 def comfy_state():
-    """ComfyUI runs in this same CT: SSH to the PVE node, then enter it."""
-    p = ssh(PVE_HOST, f"pct exec {AI_CTID} -- docker inspect -f '{{{{.State.Status}}}}' {COMFY_CONTAINER}")
+    if not COMFY:
+        return "unconfigured"
+    p = ssh(AI_HOST, ai_cmd(f"docker inspect -f '{{{{.State.Status}}}}' {COMFY_CONTAINER}"))
     return p.stdout.strip() or "unknown"
 
 
 def comfy(action):
     if action not in ("start", "stop", "restart"):
         raise HTTPException(400, "action must be start, stop or restart")
-    p = ssh(PVE_HOST, f"pct exec {AI_CTID} -- docker {action} {COMFY_CONTAINER}", timeout=90)
+    if not COMFY:
+        return {"action": action, "skipped": "ComfyUI is not configured"}
+    p = ssh(AI_HOST, ai_cmd(f"docker {action} {COMFY_CONTAINER}"), timeout=90)
     if p.returncode != 0:
         raise HTTPException(502, p.stderr.strip() or p.stdout.strip())
     return {"action": action, "ok": True}
@@ -349,7 +412,7 @@ def comfy(action):
 
 def comfy_queue_depth():
     """Prompts running or waiting: stopping the container would kill them."""
-    if not COMFY_URL:
+    if not COMFY_API:
         return 0
     try:
         queue = httpx.get(f"{COMFY_URL}/queue", timeout=6).json()
@@ -374,7 +437,7 @@ def comfy_stats():
     """State from ComfyUI itself: running, how much VRAM it sees free and how
     many prompts are queued. Silently empty when the container is down."""
     out = {"state": comfy_state()}
-    if not COMFY_URL or out["state"] != "running":
+    if not COMFY_API or out["state"] != "running":
         return out
     try:
         stats = httpx.get(f"{COMFY_URL}/system_stats", timeout=8).json()
@@ -392,16 +455,22 @@ def comfy_stats():
 
 
 def immich_ml(action):
-    p = ssh(IMMICH_HOST, f"docker {action} {IMMICH_ML}")
+    if not IMMICH:
+        return {"action": action, "skipped": "Immich is not configured"}
+    p = ssh(IMMICH_HOST, f"docker {action} {IMMICH_ML_CONTAINER}")
     if p.returncode != 0:
         raise HTTPException(502, p.stderr.strip() or p.stdout.strip())
     return {"action": action, "ok": True}
 
 
 def immich_ml_queue_active():
+    """Jobs running or waiting on the queues that want the ML container."""
+    if not IMMICH:
+        return 0
     script = "\n".join(
-        f'echo "$(docker exec immich_redis redis-cli llen immich_bull:{q}:active) $(docker exec immich_redis redis-cli llen immich_bull:{q}:wait)"'
-        for q in ML_QUEUES
+        f'echo "$(docker exec {IMMICH_REDIS_CONTAINER} redis-cli llen {IMMICH_QUEUE_PREFIX}:{q}:active) '
+        f'$(docker exec {IMMICH_REDIS_CONTAINER} redis-cli llen {IMMICH_QUEUE_PREFIX}:{q}:wait)"'
+        for q in IMMICH_ML_QUEUES
     )
     p = ssh_script(IMMICH_HOST, script)
     total = 0
@@ -412,7 +481,10 @@ def immich_ml_queue_active():
 
 
 def immich_transcode():
-    p = ssh_script(IMMICH_HOST, IMMICH_CFG_SCRIPT)
+    """Immich's own ffmpeg settings, read from its Postgres system config."""
+    if not IMMICH:
+        return {}
+    p = ssh_script(IMMICH_HOST, IMMICH_CFG_SCRIPT % IMMICH_PG_CONTAINER)
     try:
         return json.loads(p.stdout).get("ffmpeg", {})
     except Exception:
@@ -420,43 +492,49 @@ def immich_transcode():
 
 
 def jellyfin_accel():
-    p = ssh(FRONTEND_HOST, f"sed -n 's:.*<HardwareAccelerationType>\\([^<]*\\).*:\\1:p' {JELLYFIN_XML}")
+    if not JELLYFIN:
+        return "unconfigured"
+    p = ssh(JELLYFIN_HOST, f"sed -n 's:.*<HardwareAccelerationType>\\([^<]*\\).*:\\1:p' {JELLYFIN_XML}")
     return p.stdout.strip() or "unknown"
 
 
 def jellyfin_set_accel(accel):
     if accel not in ("nvenc", "vaapi", "none"):
         raise HTTPException(400, "accel must be nvenc, vaapi or none")
+    if not JELLYFIN:
+        return {"accel": accel, "skipped": "Jellyfin is not configured"}
     script = (
         "set -e\n"
         f"F={JELLYFIN_XML}\n"
-        "docker stop jellyfin >/dev/null\n"
+        f"docker stop {JELLYFIN_CONTAINER} >/dev/null\n"
         "sed -i 's#<HardwareAccelerationType>[^<]*</HardwareAccelerationType>"
         f"#<HardwareAccelerationType>{accel}</HardwareAccelerationType>#' \"$F\"\n"
-        "docker start jellyfin >/dev/null\n"
+        f"docker start {JELLYFIN_CONTAINER} >/dev/null\n"
     )
-    p = ssh_script(FRONTEND_HOST, script)
+    p = ssh_script(JELLYFIN_HOST, script)
     if p.returncode != 0:
         raise HTTPException(502, p.stderr.strip() or p.stdout.strip())
     return {"accel": accel}
 
 
 def jellyfin_ensure_accel(accel):
+    if not JELLYFIN:
+        return {"accel": accel, "skipped": "Jellyfin is not configured"}
     if jellyfin_accel() == accel:
         return {"accel": accel, "already": True}
     return jellyfin_set_accel(accel)
 
 
-def jellyfin_release_p100():
-    """Move Jellyfin to the iGPU, remembering the device it had before."""
+def jellyfin_release_gpu():
+    """Move Jellyfin off the card, remembering the device it had before."""
     current = jellyfin_accel()
     if current in ("nvenc", "vaapi"):
         state["jellyfin_before_llm"] = current
     return jellyfin_ensure_accel(JELLYFIN_FALLBACK)
 
 
-def jellyfin_reclaim_p100():
-    """Undo jellyfin_release_p100() once llama.cpp gives the card back."""
+def jellyfin_reclaim_gpu():
+    """Undo jellyfin_release_gpu() once llama.cpp gives the card back."""
     accel = state.get("jellyfin_before_llm") or "nvenc"
     state["jellyfin_before_llm"] = None
     return jellyfin_ensure_accel(accel)
@@ -568,40 +646,48 @@ def auto_tick():
         comfy_up = comfy_state() == "running"
 
     if in_use:
-        # llama.cpp has priority over every other consumer of the P100.
-        comfy_stopped = False
-        if comfy_up:
-            comfy_stopped = comfy_release(
-                None if not llm_blocked
-                else "LLM in use: ComfyUI stopped (P100 free for llama.cpp)")
-            comfy_up = comfy_up and not comfy_stopped
+        # llama.cpp has priority over every other consumer of the card.
+        done = []
+        if comfy_up and comfy_release():
+            comfy_up = False
+            done.append("ComfyUI stopped")
         if not llm_blocked:
+            # Immich ML is CUDA and cannot share; Jellyfin keeps transcoding on
+            # whatever device the fallback names.
             with contextlib.suppress(HTTPException):
-                immich_ml("stop")        # Immich ML is CUDA: it needs the P100
-                jellyfin_release_p100()  # Jellyfin keeps transcoding on the iGPU
+                if IMMICH:
+                    immich_ml("stop")
+                    done.append("Immich ML stopped")
+                if JELLYFIN:
+                    jellyfin_release_gpu()
+                    done.append("Jellyfin on %s" % JELLYFIN_DEVICES[JELLYFIN_FALLBACK])
             llm_blocked = True
-            record_action("LLM in use: %sImmich ML stopped, Jellyfin on %s (P100 free for llama.cpp)"
-                          % ("ComfyUI stopped, " if comfy_stopped else "",
-                             JELLYFIN_DEVICES[JELLYFIN_FALLBACK]))
+            if done:
+                record_action("LLM in use: %s (card free for llama.cpp)" % ", ".join(done))
         if state["llama_idle_min"] and idle > state["llama_idle_min"] * 60:
             unloaded = llama_unload_all()
             if unloaded and not comfy_up:
-                back = {"accel": state.get("jellyfin_before_llm") or "nvenc"}
+                back = []
                 with contextlib.suppress(HTTPException):
-                    immich_ml("start")
-                    back = jellyfin_reclaim_p100()
+                    if IMMICH:
+                        immich_ml("start")
+                        back.append("Immich ML on")
+                    if JELLYFIN:
+                        accel = jellyfin_reclaim_gpu().get("accel")
+                        back.append("Jellyfin back to %s" % JELLYFIN_DEVICES.get(accel, accel))
                 llm_blocked = False
-                record_action("GPU idle %d min: unloaded %s, Immich ML on, Jellyfin back to %s"
-                              % (idle // 60, ", ".join(model_names([{"id": u["model"]} for u in unloaded])),
-                                 JELLYFIN_DEVICES.get(back.get("accel"), back.get("accel"))))
+                record_action("GPU idle %d min: unloaded %s%s"
+                              % (idle // 60,
+                                 ", ".join(model_names([{"id": u["model"]} for u in unloaded])),
+                                 ("; " + ", ".join(back)) if back else ""))
     else:
         llm_blocked = False
         # An idle ComfyUI hands the card back on its own.
         if comfy_up and state["comfy_idle_min"] and idle > state["comfy_idle_min"] * 60:
-            if comfy_release("ComfyUI idle %d min: stopped, P100 free again" % (idle // 60)):
+            if comfy_release("ComfyUI idle %d min: stopped, card free again" % (idle // 60)):
                 comfy_up = False
 
-    if state["ml_idle_min"] and idle > state["ml_idle_min"] * 60:
+    if IMMICH and state["ml_idle_min"] and idle > state["ml_idle_min"] * 60:
         if immich_ml_state() == "running" and immich_ml_queue_active() == 0:
             with contextlib.suppress(HTTPException):
                 immich_ml("stop")
@@ -646,7 +732,7 @@ def login(request: Request, body: dict = Body(...)):
     ok = bool(PANEL_PASSWORD) and secrets.compare_digest(user, PANEL_USER) and secrets.compare_digest(password, PANEL_PASSWORD)
     if not ok:
         time.sleep(LOGIN_DELAY)
-        raise HTTPException(401, "usuario o contraseña incorrectos")
+        raise HTTPException(401, "wrong user or password")
     response = JSONResponse({"ok": True, "user": user})
     response.set_cookie(
         SESSION_COOKIE,
@@ -691,6 +777,15 @@ def status(_: str = Depends(require_auth)):
     # the 20-second tick, so a card that just came back shows up at once.
     track_gpus(out["gpus"])
     out["inventory"] = inventory_view(out["gpus"])
+    # What this deployment has: the dashboard says "not configured" instead of
+    # showing a consumer's controls as broken.
+    out["configured"] = {
+        "immich": IMMICH,
+        "jellyfin": JELLYFIN,
+        "comfyui": COMFY,
+        "comfyui_api": COMFY_API,
+        "llama_logs": bool(AI_HOST),
+    }
     for key, fn in (
         ("immich_ml", immich_ml_state),
         ("immich_ffmpeg", immich_transcode),
@@ -723,43 +818,62 @@ def status(_: str = Depends(require_auth)):
 def set_mode(mode: str, _: str = Depends(require_auth)):
     global llm_blocked
     result = {}
+    done = []
     # ComfyUI would keep holding the card: stop it before leaving Image mode.
-    if mode in ("llm", "media", "balanced"):
+    if mode in ("llm", "media", "balanced") and COMFY:
         with contextlib.suppress(Exception):
             if comfy_state() == "running":
                 result["comfyui"] = comfy("stop")
+                done.append("ComfyUI stopped")
 
     if mode == "llm":
-        result["immich_ml"] = immich_ml("stop")        # CUDA: it needs the P100
-        result["jellyfin"] = jellyfin_release_p100()   # iGPU keeps transcoding
+        if IMMICH:
+            result["immich_ml"] = immich_ml("stop")
+            done.append("Immich ML stopped")
+        if JELLYFIN:
+            result["jellyfin"] = jellyfin_release_gpu()
+            done.append("Jellyfin on %s" % JELLYFIN_DEVICES[JELLYFIN_FALLBACK])
         llm_blocked = True
-        record_action("mode LLM: Immich ML stopped, Jellyfin on %s (P100 free for llama.cpp)"
-                      % JELLYFIN_DEVICES[JELLYFIN_FALLBACK])
+        record_action("mode LLM: %s (card free for llama.cpp)" % (", ".join(done) or "nothing to move"))
     elif mode == "media":
         result["llama"] = llama_unload_all()
-        result["immich_ml"] = immich_ml("start")
-        result["jellyfin"] = jellyfin_ensure_accel("nvenc")
+        done.append("llama.cpp unloaded")
+        if IMMICH:
+            result["immich_ml"] = immich_ml("start")
+            done.append("Immich ML on")
+        if JELLYFIN:
+            result["jellyfin"] = jellyfin_ensure_accel("nvenc")
+            done.append("Jellyfin on %s" % JELLYFIN_DEVICES["nvenc"])
         state["jellyfin_before_llm"] = None
         llm_blocked = False
-        record_action("mode Media: llama.cpp unloaded, Immich ML + Jellyfin (NVENC on the P100) on")
+        record_action("mode Media: %s" % ", ".join(done))
     elif mode == "balanced":
-        result["immich_ml"] = immich_ml("start")
-        result["jellyfin"] = jellyfin_ensure_accel("nvenc")
+        if IMMICH:
+            result["immich_ml"] = immich_ml("start")
+            done.append("Immich ML on")
+        if JELLYFIN:
+            result["jellyfin"] = jellyfin_ensure_accel("nvenc")
+            done.append("Jellyfin on %s" % JELLYFIN_DEVICES["nvenc"])
         state["jellyfin_before_llm"] = None
         llm_blocked = False
-        record_action("mode Shared: Immich ML + Jellyfin (NVENC on the P100, LLM not unloaded) on")
+        record_action("mode Shared: %s (llama.cpp not unloaded)" % (", ".join(done) or "nothing to move"))
     elif mode == "image":
         # Image generation needs the whole card: unload llama.cpp, stop the CUDA
-        # Immich workload and move Jellyfin to the iGPU (it keeps transcoding).
+        # Immich workload and move Jellyfin off (it keeps transcoding).
         result["llama"] = llama_unload_all()
-        result["immich_ml"] = immich_ml("stop")
-        result["jellyfin"] = jellyfin_release_p100()
+        done.append("llama.cpp unloaded")
+        if IMMICH:
+            result["immich_ml"] = immich_ml("stop")
+            done.append("Immich ML stopped")
+        if JELLYFIN:
+            result["jellyfin"] = jellyfin_release_gpu()
+            done.append("Jellyfin on %s" % JELLYFIN_DEVICES[JELLYFIN_FALLBACK])
         state["jellyfin_before_llm"] = None
-        result["comfyui"] = comfy("start")
+        if COMFY:
+            result["comfyui"] = comfy("start")
+            done.append("ComfyUI started with the card to itself")
         llm_blocked = False
-        record_action("mode Image: llama.cpp unloaded, Immich ML stopped, "
-                      "Jellyfin on %s; ComfyUI started with the P100 to itself"
-                      % JELLYFIN_DEVICES[JELLYFIN_FALLBACK])
+        record_action("mode Image: %s" % ", ".join(done))
     else:
         raise HTTPException(400, "mode must be llm, media, balanced or image")
     return result
@@ -785,9 +899,13 @@ def set_power(body: dict = Body(...), _: str = Depends(require_auth)):
         watts = int(body.get("watts"))
     except (TypeError, ValueError):
         raise HTTPException(400, "watts must be an integer")
-    if not 125 <= watts <= 250:
-        raise HTTPException(400, "watts must be between 125 and 250")
-    p = ssh(PVE_HOST, f"nvidia-smi -pl {watts}")
+    # The range is the card's, not a constant: a P100 allows 125-250 W and
+    # anything else reports its own limits.
+    card = gpu_status()
+    low, high = int(float(card["power_min"])), int(float(card["power_max"]))
+    if not low <= watts <= high:
+        raise HTTPException(400, f"watts must be between {low} and {high}")
+    p = ssh(GPU_HOST, f"nvidia-smi -pl {watts}")
     if p.returncode != 0:
         raise HTTPException(502, p.stderr.strip() or p.stdout.strip())
     record_action(f"power limit = {watts} W")
@@ -804,7 +922,13 @@ def llama_unload(_: str = Depends(require_auth)):
 def llama_logs_api(lines: int = 200, _: str = Depends(require_auth)):
     """Tail of the llama.cpp service log, for debugging a load or a crash."""
     out = llama_logs(lines)
-    return {"unit": LLAMA_LOG_UNIT, "container": AI_CTID, "count": len(out), "lines": out}
+    return {
+        "unit": LLAMA_LOG_UNIT,
+        "host": AI_HOST,
+        "ct": AI_CTID or None,
+        "count": len(out),
+        "lines": out,
+    }
 
 
 @app.post("/api/comfy/{action}")
