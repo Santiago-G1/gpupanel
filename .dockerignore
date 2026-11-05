@@ -1,11 +1,16 @@
 # The image only needs the application: everything else is for the repository.
 .git
+.github
 .gitignore
 .dockerignore
 README.md
+*.md
 .env
 .env.*
-*.md
 state/
 __pycache__/
 *.pyc
+# Development only: tests, lint config and their dependencies.
+tests/
+pyproject.toml
+requirements-dev.txt
