@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The image pins 3.12; 3.10 is here because the code claims to run there.
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t gpu-panel:ci .
+      - name: It starts and answers without a GPU
+        run: |
+          docker run -d --name panel -p 8099:8099 \
+            -e GPU_HOST=root@nowhere -e LLAMA_URL=http://127.0.0.1:9 \
+            -e PANEL_PASSWORD=ci -e PANEL_TOKEN=ci gpu-panel:ci
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8099/api/session || true)
+            [ "$code" = "200" ] && break
+            sleep 1
+          done
+          test "$code" = "200" || { docker logs panel; exit 1; }
+          # The card host does not exist, so a probe must fail cleanly.
+          curl -s -o /dev/null -w '%{http_code}\n' -H 'Authorization: Bearer ci' \
+            http://127.0.0.1:8099/api/status | grep -qx 502
+          docker rm -f panel
