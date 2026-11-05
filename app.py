@@ -64,7 +64,7 @@ def number(name, default, cast=int):
     try:
         return cast(raw)
     except ValueError:
-        raise RuntimeError(f"{name} must be a number, not {raw!r}")
+        raise RuntimeError(f"{name} must be a number, not {raw!r}") from None
 
 
 def as_number(value, default=0.0):
@@ -358,7 +358,7 @@ def gpu_status():
         parts = [v.strip() for v in line.split(",")]
         if len(parts) != len(GPU_KEYS):
             continue
-        gpu = dict(zip(GPU_KEYS, parts))
+        gpu = dict(zip(GPU_KEYS, parts, strict=True))
         gpu["processes"] = []
         gpus.append(gpu)
     if not gpus:
@@ -413,7 +413,7 @@ def llama_logs(lines=200):
     try:
         lines = max(20, min(int(lines), LLAMA_LOG_MAX))
     except (TypeError, ValueError):
-        raise HTTPException(400, "lines must be an integer")
+        raise HTTPException(400, "lines must be an integer") from None
     p = ssh(
         AI_HOST,
         ai_cmd(f"journalctl -u {LLAMA_LOG_UNIT} -n {lines} --no-pager -o short-iso"),
@@ -437,7 +437,7 @@ def model_names(models):
     names = [m.get("id") for m in listed]
     unlisted = len(models) - len(listed)
     if unlisted:
-        names.append("%d unlisted" % unlisted)
+        names.append(f"{unlisted} unlisted")
     return names
 
 
@@ -660,12 +660,15 @@ def track_gpus(gpus):
         "removed": removed,
         "count": len(uuids),
     }
+    def label(cards):
+        return ", ".join(f"{g['name']} ({_short(g['uuid'])})" for g in cards)
+
     parts = []
     if added:
-        parts.append("%d new GPU: %s" % (len(added), ", ".join("%s (%s)" % (g["name"], _short(g["uuid"])) for g in added)))
+        parts.append(f"{len(added)} new GPU: {label(added)}")
     if removed:
-        parts.append("%d GPU lost: %s" % (len(removed), ", ".join("%s (%s)" % (g["name"], _short(g["uuid"])) for g in removed)))
-    record_action("cards changed (now %d): %s" % (len(uuids), "; ".join(parts)))
+        parts.append(f"{len(removed)} GPU lost: {label(removed)}")
+    record_action(f"cards changed (now {len(uuids)}): {'; '.join(parts)}")
 
 
 def inventory_view(gpus):
@@ -723,10 +726,10 @@ def auto_tick():
                     done.append("Immich ML stopped")
                 if JELLYFIN:
                     jellyfin_release_gpu()
-                    done.append("Jellyfin on %s" % JELLYFIN_DEVICES[JELLYFIN_FALLBACK])
+                    done.append(f"Jellyfin on {JELLYFIN_DEVICES[JELLYFIN_FALLBACK]}")
             llm_blocked = True
             if done:
-                record_action("LLM in use: %s (card free for llama.cpp)" % ", ".join(done))
+                record_action(f"LLM in use: {', '.join(done)} (card free for llama.cpp)")
         if state["llama_idle_min"] and idle > state["llama_idle_min"] * 60:
             unloaded = llama_unload_all()
             if unloaded and not comfy_up:
@@ -737,24 +740,23 @@ def auto_tick():
                         back.append("Immich ML on")
                     if JELLYFIN:
                         accel = jellyfin_reclaim_gpu().get("accel")
-                        back.append("Jellyfin back to %s" % JELLYFIN_DEVICES.get(accel, accel))
+                        back.append(f"Jellyfin back to {JELLYFIN_DEVICES.get(accel, accel)}")
                 llm_blocked = False
-                record_action("GPU idle %d min: unloaded %s%s"
-                              % (idle // 60,
-                                 ", ".join(model_names([{"id": u["model"]} for u in unloaded])),
-                                 ("; " + ", ".join(back)) if back else ""))
+                names = ", ".join(model_names([{"id": u["model"]} for u in unloaded]))
+                record_action(f"GPU idle {idle // 60} min: unloaded {names}"
+                              f"{('; ' + ', '.join(back)) if back else ''}")
     else:
         llm_blocked = False
         # An idle ComfyUI hands the card back on its own.
         if comfy_up and state["comfy_idle_min"] and idle > state["comfy_idle_min"] * 60:
-            if comfy_release("ComfyUI idle %d min: stopped, card free again" % (idle // 60)):
+            if comfy_release(f"ComfyUI idle {idle // 60} min: stopped, card free again"):
                 comfy_up = False
 
     if IMMICH and state["ml_idle_min"] and idle > state["ml_idle_min"] * 60:
         if immich_ml_state() == "running" and immich_ml_queue_active() == 0:
             with contextlib.suppress(HTTPException):
                 immich_ml("stop")
-            record_action("Immich ML idle %d min: stopped to free VRAM" % (idle // 60))
+            record_action(f"Immich ML idle {idle // 60} min: stopped to free VRAM")
 
 
 async def auto_loop():
@@ -895,9 +897,9 @@ def set_mode(mode: str, _: str = Depends(require_auth)):
             done.append("Immich ML stopped")
         if JELLYFIN:
             result["jellyfin"] = jellyfin_release_gpu()
-            done.append("Jellyfin on %s" % JELLYFIN_DEVICES[JELLYFIN_FALLBACK])
+            done.append(f"Jellyfin on {JELLYFIN_DEVICES[JELLYFIN_FALLBACK]}")
         llm_blocked = True
-        record_action("mode LLM: %s (card free for llama.cpp)" % (", ".join(done) or "nothing to move"))
+        record_action(f"mode LLM: {', '.join(done) or 'nothing to move'} (card free for llama.cpp)")
     elif mode == "media":
         result["llama"] = llama_unload_all()
         done.append("llama.cpp unloaded")
@@ -906,20 +908,20 @@ def set_mode(mode: str, _: str = Depends(require_auth)):
             done.append("Immich ML on")
         if JELLYFIN:
             result["jellyfin"] = jellyfin_ensure_accel("nvenc")
-            done.append("Jellyfin on %s" % JELLYFIN_DEVICES["nvenc"])
+            done.append(f"Jellyfin on {JELLYFIN_DEVICES['nvenc']}")
         state["jellyfin_before_llm"] = None
         llm_blocked = False
-        record_action("mode Media: %s" % ", ".join(done))
+        record_action(f"mode Media: {', '.join(done)}")
     elif mode == "balanced":
         if IMMICH:
             result["immich_ml"] = immich_ml("start")
             done.append("Immich ML on")
         if JELLYFIN:
             result["jellyfin"] = jellyfin_ensure_accel("nvenc")
-            done.append("Jellyfin on %s" % JELLYFIN_DEVICES["nvenc"])
+            done.append(f"Jellyfin on {JELLYFIN_DEVICES['nvenc']}")
         state["jellyfin_before_llm"] = None
         llm_blocked = False
-        record_action("mode Shared: %s (llama.cpp not unloaded)" % (", ".join(done) or "nothing to move"))
+        record_action(f"mode Shared: {', '.join(done) or 'nothing to move'} (llama.cpp not unloaded)")
     elif mode == "image":
         # Image generation needs the whole card: unload llama.cpp, stop the CUDA
         # Immich workload and move Jellyfin off (it keeps transcoding).
@@ -930,13 +932,13 @@ def set_mode(mode: str, _: str = Depends(require_auth)):
             done.append("Immich ML stopped")
         if JELLYFIN:
             result["jellyfin"] = jellyfin_release_gpu()
-            done.append("Jellyfin on %s" % JELLYFIN_DEVICES[JELLYFIN_FALLBACK])
+            done.append(f"Jellyfin on {JELLYFIN_DEVICES[JELLYFIN_FALLBACK]}")
         state["jellyfin_before_llm"] = None
         if COMFY:
             result["comfyui"] = comfy("start")
             done.append("ComfyUI started with the card to itself")
         llm_blocked = False
-        record_action("mode Image: %s" % ", ".join(done))
+        record_action(f"mode Image: {', '.join(done)}")
     else:
         raise HTTPException(400, "mode must be llm, media, balanced or image")
     return result
@@ -961,7 +963,7 @@ def set_power(body: dict = Body(...), _: str = Depends(require_auth)):
     try:
         watts = int(body.get("watts"))
     except (TypeError, ValueError):
-        raise HTTPException(400, "watts must be an integer")
+        raise HTTPException(400, "watts must be an integer") from None
     # The range is the card's, not a constant: a P100 allows 125-250 W and
     # anything else reports its own limits. A card that reports neither (or
     # answers `N/A`) is left to nvidia-smi, whose refusal is the honest answer.
