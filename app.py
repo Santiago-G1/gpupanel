@@ -53,9 +53,11 @@ LLAMA_LOG_MAX = 2000
 COMFY_URL = os.environ.get("COMFY_URL", "")
 COMFY_UI_URL = os.environ.get("COMFY_UI_URL", "")
 COMFY_CONTAINER = os.environ.get("COMFY_CONTAINER", "comfyui")
+# Both are required: an empty password would leave the panel unloggable, and an
+# empty token would sign every session with the same predictable key.
 PANEL_USER = os.environ.get("PANEL_USER", "admin")
-PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD", "")
-PANEL_TOKEN = os.environ.get("PANEL_TOKEN", "")
+PANEL_PASSWORD = required("PANEL_PASSWORD")
+PANEL_TOKEN = required("PANEL_TOKEN")
 SESSION_COOKIE = os.environ.get("SESSION_COOKIE", "panel_session")
 SESSION_TTL = int(os.environ.get("SESSION_TTL", 7 * 24 * 3600))
 LOGIN_DELAY = float(os.environ.get("LOGIN_DELAY", 0.4))
