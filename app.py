@@ -102,7 +102,20 @@ busy_samples = deque(maxlen=240)
 last_busy = time.time()
 llm_blocked = False
 
-app = FastAPI(title="GPU control panel")
+@contextlib.asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Load the saved settings and start the auto-switch tick."""
+    load_state()
+    task = asyncio.create_task(auto_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+app = FastAPI(title="GPU control panel", lifespan=lifespan)
 # Shared by the dashboard and the guide.
 app.mount("/static", StaticFiles(directory=os.path.join(APP_DIR, "static")), name="static")
 
@@ -526,12 +539,6 @@ async def auto_loop():
         with contextlib.suppress(Exception):
             await asyncio.to_thread(auto_tick)
         await asyncio.sleep(20)
-
-
-@app.on_event("startup")
-async def _startup():
-    load_state()
-    asyncio.create_task(auto_loop())
 
 
 # --- pages ---
