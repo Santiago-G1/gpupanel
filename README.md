@@ -120,6 +120,7 @@ file, so a card that changed owner overnight can be explained afterwards.
 | `static/panel.css` | Shared by the dashboard and the guide. |
 | `docker-compose.yml` | The stack: build, published port, SSH key, state volume, health check. |
 | `.env.template` | Every variable the Compose file reads. Never a real secret. |
+| `LICENSE` | MIT: use it, fork it, keep the notice. |
 | `tests/` | `pytest` suite: the panel's promises, with the probes replaced by stubs. |
 | `pyproject.toml` | Ruff and pytest configuration (`requirements-dev.txt` for the tools). |
 | `.github/workflows/ci.yml` | Lint, tests on 3.10 and 3.12, and a boot of the built image. |
@@ -187,7 +188,7 @@ it usable from scripts.
 | `/api/status` | GET | Every card the host reports, the processes on them attributed by UUID, `inventory` (cards vs expected), `configured` (which consumers exist here), `auto`, Immich, Jellyfin, the router's models and ComfyUI's stats. |
 | `/api/mode/{llm,media,balanced,image}` | POST | The table above. |
 | `/api/auto` | POST | `enabled` and the three idle timers, `0…1440` minutes. |
-| `/api/power` | POST | `nvidia-smi -pl`, bounded to the range the card itself reports (`power.min_limit`/`max_limit`), so no card is limited by a constant. |
+| `/api/power` | POST | `nvidia-smi -i <index> -pl`, per card. Bounded by what the cards report, and the answer says which ones refused. |
 | `/api/llama/unload` | POST | Unload every resident model. |
 | `/api/llama/logs?lines=200` | GET | `journalctl` of the unit on `AI_HOST` (through `pct exec` when `AI_CTID` is set), capped at 2000 lines. |
 | `/api/comfy/{start,stop,restart}` | POST | The ComfyUI container on `AI_HOST`; skipped when `COMFY_CONTAINER` is empty. |
@@ -195,7 +196,49 @@ it usable from scripts.
 | `/api/jellyfin/accel/{nvenc,vaapi,none}` | POST | Rewrite the config and restart `JELLYFIN_CONTAINER`; skipped when not configured. |
 
 Every `502` carries the failing command's own stderr, because the useful part of
-a broken SSH hop is what the far side said.
+a broken SSH hop is what the far side said. A timeout is one of those answers:
+`timed out after 30s`, never a traceback.
+
+`/api/status` is the document a widget or a script parses, so here it is,
+abridged and with the numbers shortened:
+
+```json
+{
+  "gpu": {
+    "index": "0", "uuid": "GPU-00000000-…", "name": "Tesla P100-PCIE-16GB",
+    "driver": "580.159.04", "mem_used": "14478", "mem_total": "16384",
+    "util": "0", "util_max": 0, "temp": "39",
+    "power_draw": "36.71", "power_limit": "200.00",
+    "power_min": "125.00", "power_max": "250.00", "power_limits": ["200.00"],
+    "clk_sm": "1328", "clk_mem": "715", "pcie_gen": "3", "pcie_width": "16",
+    "processes": [{"pid": "3331196", "name": "…/llama-server", "mem_mib": 14478, "gpu": "0"}]
+  },
+  "gpus": [ "…one entry per card, the shape of `gpu` above…" ],
+  "auto": {
+    "enabled": true, "llama_idle_min": 60, "ml_idle_min": 0, "comfy_idle_min": 10,
+    "idle_seconds": 42, "llm_blocked": true,
+    "last_action": "LLM in use: Immich ML stopped (card free for llama.cpp)",
+    "last_action_at": "2026-11-05 08:25:32"
+  },
+  "inventory": {
+    "count": 2, "expected": 2, "missing": 0, "last_change": null,
+    "present": [{"uuid": "GPU-00000000-…", "index": "0", "name": "Tesla P100-PCIE-16GB"}]
+  },
+  "configured": {"immich": true, "jellyfin": true, "comfyui": true, "comfyui_api": true, "llama_logs": true},
+  "immich_ml": "running",
+  "immich_ffmpeg": {"accel": "nvenc", "preferredHwDevice": ""},
+  "jellyfin_accel": "vaapi",
+  "llama": [{"id": "some-model", "status": "loaded"}],
+  "llama_counts": {"total": 7, "loaded": 1},
+  "comfyui": {"state": "created"}
+}
+```
+
+The readings are strings exactly as `nvidia-smi` prints them, `N/A` included; the
+two computed fields are `util_max` (an int) for the idle clock and `power_limits`
+(one per card) for the dashboard. A consumer that is not configured answers
+`"unconfigured"` instead of an object, so a client can tell it apart from a
+consumer that is down.
 
 ## Configuration
 
@@ -271,6 +314,12 @@ the Jellyfin device to restore and the card inventory (`gpus_known`, the names o
 cards that have since disappeared, and the last change). Losing it costs a re-login and the timers
 going back to their defaults; the card is where the truth is.
 
+## Licence
+
+MIT — see [`LICENSE`](LICENSE). A hosted derivative that must stay open is the
+one thing this licence does not require; AGPL-3.0 would, and it is a single file
+to replace.
+
 ## Troubleshooting
 
 | Symptom | What it means |
@@ -280,6 +329,7 @@ going back to their defaults; the card is where the truth is.
 | everything reads `not configured` | those variables are empty on purpose; see [Adapting it to your setup](#adapting-it-to-your-setup) |
 | `1 of 2 · 1 card missing` | `GPU_EXPECTED` is above what `nvidia-smi` answers: the card is not initialising |
 | `Power limit: not reported by the card` | the card exposes no settable range (typical on vGPU); the slider is disabled |
+| `N card(s) refused … W` | the limit was set on the cards that accept it; the others are named with their own `nvidia-smi` error |
 | signed out after changing a password or the token | the session key is derived from both, so rotating either revokes every cookie |
 | the browser keeps asking to log in behind a proxy | the cookie is `Secure` only when the request says HTTPS; forward `X-Forwarded-Proto` |
 | `403 cross-origin request rejected` | a write came from another origin with a session cookie; use the bearer token for scripts |
