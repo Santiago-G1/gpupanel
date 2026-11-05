@@ -14,11 +14,12 @@ import contextlib
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import subprocess
+import threading
 import time
-from collections import deque
 from urllib.parse import urlparse
 
 import httpx
@@ -171,11 +172,13 @@ GPU_KEYS = [
 DEFAULTS = {"enabled": True, "llama_idle_min": 60, "ml_idle_min": 0, "comfy_idle_min": 10, "last_action": None, "last_action_at": None, "revoked": {}, "jellyfin_before_llm": None, "gpus_known": None, "gpus_names": {}, "gpus_last_change": None}
 
 
+log = logging.getLogger("gpu-panel")
+
 # Derived from the credentials: rotating either one logs every browser out.
 SESSION_KEY = hashlib.sha256(f"session|{PANEL_PASSWORD}|{PANEL_TOKEN}".encode()).digest()
 
 state = dict(DEFAULTS)
-busy_samples = deque(maxlen=240)
+STATE_LOCK = threading.Lock()
 last_busy = time.time()
 llm_blocked = False
 
@@ -199,18 +202,42 @@ app.mount("/static", StaticFiles(directory=os.path.join(APP_DIR, "static")), nam
 
 # --- state ---
 def load_state():
+    """Settings from the volume. A missing file is normal; a broken one is not."""
     try:
         with open(STATE_PATH) as fh:
-            state.update({k: v for k, v in json.load(fh).items() if k in DEFAULTS})
-    except Exception:
-        pass
+            stored = json.load(fh)
+    except FileNotFoundError:
+        return
+    except Exception as exc:  # noqa: BLE001 - a bad file must not stop the panel
+        log.warning("ignoring %s: %s", STATE_PATH, exc)
+        return
+    with STATE_LOCK:
+        state.update({k: v for k, v in stored.items() if k in DEFAULTS})
 
 
 def save_state():
-    with contextlib.suppress(Exception):
-        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-        with open(STATE_PATH, "w") as fh:
-            json.dump(state, fh, indent=2)
+    """Written to a temporary file and renamed: a crash must not truncate it.
+
+    The endpoints run in a thread pool, so two saves can overlap; the rename is
+    atomic and the lock keeps them from writing the same temporary file.
+    """
+    parent = os.path.dirname(STATE_PATH) or "."
+    with STATE_LOCK:
+        try:
+            blob = json.dumps(dict(state), indent=2)
+        except TypeError as exc:  # a non-serialisable value would otherwise vanish
+            log.warning("state is not serialisable: %s", exc)
+            return
+        tmp = f"{STATE_PATH}.tmp"
+        try:
+            os.makedirs(parent, exist_ok=True)
+            with open(tmp, "w") as fh:
+                fh.write(blob)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, STATE_PATH)
+        except OSError as exc:
+            log.warning("could not save %s: %s", STATE_PATH, exc)
 
 
 # --- auth: login page -> signed session cookie; bearer token for automation ---
@@ -658,7 +685,6 @@ def auto_tick():
     # kept even when the auto mode is off.
     track_gpus(gpu["gpus"])
     util = gpu["util_max"]
-    busy_samples.append(util)
     if util > 0:
         last_busy = time.time()
     if not state["enabled"]:
