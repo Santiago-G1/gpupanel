@@ -728,8 +728,10 @@ def auto_tick():
                     jellyfin_release_gpu()
                     done.append(f"Jellyfin on {JELLYFIN_DEVICES[JELLYFIN_FALLBACK]}")
             llm_blocked = True
-            if done:
-                record_action(f"LLM in use: {', '.join(done)} (card free for llama.cpp)")
+        # Outside the `llm_blocked` check: a ComfyUI that was stopped on a later
+        # tick still happened, and the last-action line is the only record of it.
+        if done:
+            record_action(f"LLM in use: {', '.join(done)} (card free for llama.cpp)")
         if state["llama_idle_min"] and idle > state["llama_idle_min"] * 60:
             unloaded = llama_unload_all()
             if unloaded and not comfy_up:

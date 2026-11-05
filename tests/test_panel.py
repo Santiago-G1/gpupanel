@@ -139,6 +139,20 @@ def test_auto_switch_leaves_absent_consumers_alone(panel):
     assert panel.state["last_action"] is None
 
 
+def test_a_comfy_only_stop_is_still_recorded(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, COMFY_CONTAINER="comfyui")
+    stub_gpu(panel, card(util="90"))
+    panel.llama_models = lambda: [{"id": "big", "status": "loaded"}]
+    # Already in LLM priority: this tick only has ComfyUI left to move.
+    monkeypatch.setattr(panel, "llm_blocked", True)
+    monkeypatch.setattr(panel, "comfy_state", lambda: "running")
+    monkeypatch.setattr(panel, "comfy", lambda action: {"action": action, "ok": True})
+
+    panel.auto_tick()
+
+    assert panel.state["last_action"].startswith("LLM in use: ComfyUI stopped")
+
+
 # --- readings the card does not report --------------------------------------
 def test_na_readings_do_not_crash_the_status(panel):
     stub_gpu(panel, card(util="N/A", power_min="N/A", power_max="N/A", power_limit="N/A"))
