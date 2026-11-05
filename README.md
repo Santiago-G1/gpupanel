@@ -21,6 +21,19 @@ The panel talks to the router by address, because inside its own container
 key is the mount that matters. Nothing in the list is mandatory except the card
 host and the router: see [Adapting it to your setup](#adapting-it-to-your-setup).
 
+## Requirements
+
+| What | Why |
+| --- | --- |
+| Docker with Compose v2 | the only runtime dependency; nothing is installed on the hosts |
+| `nvidia-smi` on `GPU_HOST`, over SSH with a key | the cards, their processes and the power limit |
+| A llama.cpp router (`/v1/models`, `/models/unload`) | llama.cpp in router mode or llama-swap |
+| SSH to the consumers' hosts | `docker` there for Immich, a file rewrite for Jellyfin, `pct exec` only with `AI_CTID` |
+| journald on `AI_HOST` | only for the log tail endpoint |
+
+No Python, no agent and no client library goes on the hosts: every consumer is
+either an HTTP call or a command over SSH.
+
 ## The consumers
 
 | Consumer | Reached by | Occupies | What the panel does to it |
@@ -107,6 +120,9 @@ file, so a card that changed owner overnight can be explained afterwards.
 | `static/panel.css` | Shared by the dashboard and the guide. |
 | `docker-compose.yml` | The stack: build, published port, SSH key, state volume, health check. |
 | `.env.template` | Every variable the Compose file reads. Never a real secret. |
+| `tests/` | `pytest` suite: the panel's promises, with the probes replaced by stubs. |
+| `pyproject.toml` | Ruff and pytest configuration (`requirements-dev.txt` for the tools). |
+| `.github/workflows/ci.yml` | Lint, tests on 3.10 and 3.12, and a boot of the built image. |
 
 ## Run it
 
@@ -131,6 +147,26 @@ host.
 # from the homelab repository's ansible/ directory
 ansible-playbook playbooks/stacks.yml --limit ai -e '{"stacks_only":["gpu-panel"]}'
 ```
+
+## Development
+
+```sh
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements-dev.txt
+ruff check .          # lint
+pytest                # tests
+```
+
+The tests never touch a GPU, a host or an SSH key: `tests/conftest.py` imports
+`app` with a fake environment and each test replaces the probe it cares about, so
+"a card that answers `N/A`", "a deployment with no Immich" or "an unreachable
+host" are three ordinary cases. `tests/test_ui.py` checks the other half — that
+every element the dashboard looks up exists in the markup, and that the inline
+JavaScript parses.
+
+CI runs the same two commands on Python 3.10 and 3.12, and then builds the image
+and boots it with no card to prove that it answers `/api/session` and fails
+cleanly (`502`) everywhere else.
 
 ## API
 
@@ -234,6 +270,19 @@ revoked session nonces (sessions are stateless, so a logout has to remember one)
 the Jellyfin device to restore and the card inventory (`gpus_known`, the names of
 cards that have since disappeared, and the last change). Losing it costs a re-login and the timers
 going back to their defaults; the card is where the truth is.
+
+## Troubleshooting
+
+| Symptom | What it means |
+| --- | --- |
+| `502 nvidia-smi failed: … Permission denied (publickey)` | the key in `/root/.ssh` does not reach `GPU_HOST`; nothing else will work either |
+| `502 … timed out after 30s` | a host is unreachable — the panel turns a timeout into a `502`, never a `500` |
+| everything reads `not configured` | those variables are empty on purpose; see [Adapting it to your setup](#adapting-it-to-your-setup) |
+| `1 of 2 · 1 card missing` | `GPU_EXPECTED` is above what `nvidia-smi` answers: the card is not initialising |
+| `Power limit: not reported by the card` | the card exposes no settable range (typical on vGPU); the slider is disabled |
+| signed out after changing a password or the token | the session key is derived from both, so rotating either revokes every cookie |
+| the browser keeps asking to log in behind a proxy | the cookie is `Secure` only when the request says HTTPS; forward `X-Forwarded-Proto` |
+| `403 cross-origin request rejected` | a write came from another origin with a session cookie; use the bearer token for scripts |
 
 ## Secrets
 
