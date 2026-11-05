@@ -43,6 +43,13 @@
     loading or loaded, the other CUDA consumers step aside) and <b>nothing stays
     on the card idle</b> (each consumer has a release timer).
   </div>
+  <div class="k" style="margin-top:8px">
+    A third rule is about the cards themselves: the panel remembers which ones it
+    has seen by UUID. If <b>nvidia-smi answers with fewer cards than expected</b>
+    the dashboard says so at the top, because a P100 that does not initialise is
+    silent everywhere else — and a card that comes back is recorded with the
+    moment it did.
+  </div>
 </div>
 
 <h2 id="modes">GPU modes</h2>

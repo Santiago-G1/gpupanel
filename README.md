@@ -43,6 +43,27 @@ Two rules decide everything:
 2. **Nothing stays on the card idle.** Each consumer has a release timer, so an
    abandoned ComfyUI or a forgotten LLM hands the P100 back on its own.
 
+## Card inventory
+
+A card that does not initialise is silent everywhere else: no driver error
+reaches the panel, `nvidia-smi` just answers with one card fewer, and everything
+still works on the ones that are there. That is exactly how the second P100
+fails after a kernel update here, so the panel keeps the set of UUIDs it has
+seen and compares it with every observation (the 20-second tick, plus each
+dashboard load):
+
+| Situation | What the dashboard shows |
+| --- | --- |
+| `count == GPU_EXPECTED` | a quiet `2 of 2` pill |
+| `count < GPU_EXPECTED` | `1 of 2 · 1 card missing`, with the reason it cannot be fixed from here |
+| a card appears | `new card`, its name, its UUID and when it came up |
+| `GPU_EXPECTED=0` | only changes are reported; nothing is called missing |
+
+A change is written to the state file and to the last-action line, so a card
+that vanished overnight has a timestamp in the morning. The comparison is on the
+UUID set, not the count: a card that is swapped for another is a change too, and
+the order `nvidia-smi` reports them in is not.
+
 ## Modes
 
 The four buttons are fixed sequences, not settings: each one leaves the card in
@@ -125,7 +146,7 @@ it usable from scripts.
 | Endpoint | Method | What it does |
 | --- | --- | --- |
 | `/api/session` | GET | Who the caller is. The only probe that never leaves the container. |
-| `/api/status` | GET | Every card the node reports, the processes on them attributed by UUID, `auto`, Immich, Jellyfin, the router's models and ComfyUI's stats. |
+| `/api/status` | GET | Every card the node reports, the processes on them attributed by UUID, `inventory` (cards vs expected), `auto`, Immich, Jellyfin, the router's models and ComfyUI's stats. |
 | `/api/mode/{llm,media,balanced,image}` | POST | The table above. |
 | `/api/auto` | POST | `enabled` and the three idle timers, `0…1440` minutes. |
 | `/api/power` | POST | `nvidia-smi -pl`, bounded to the range the card reports (`125–250 W` on a P100). |
@@ -155,6 +176,7 @@ a broken SSH hop is what the far side said.
 | `COMFY_UI_URL` | empty | Link out to its web UI. |
 | `COMFY_CONTAINER` | `comfyui` | Container name inside the AI container. |
 | `LLAMA_PUBLIC_MODELS` | empty | Comma-separated substrings. Empty names every model the router serves. |
+| `GPU_EXPECTED` | `0` | Cards the node should have. `0` reports what `nvidia-smi` answers without calling anything missing. |
 | `SESSION_TTL` | `604800` | Seconds. |
 | `LOGIN_DELAY` | `0.4` | Seconds burned on a bad password. |
 | `STATE_PATH` | `/state/auto.json` | Inside the named volume. |
@@ -167,8 +189,9 @@ them. That keeps a model the lab does not advertise out of a screenshot.
 
 `/state/auto.json`, in the `gpu_panel_state` volume, holds what has to survive a
 recreate: the auto-switch settings, the last action and when it happened, the
-revoked session nonces (sessions are stateless, so a logout has to remember one)
-and the Jellyfin device to restore. Losing it costs a re-login and the timers
+revoked session nonces (sessions are stateless, so a logout has to remember one),
+the Jellyfin device to restore and the card inventory (`gpus_known`, the names of
+cards that have since disappeared, and the last change). Losing it costs a re-login and the timers
 going back to their defaults; the card is where the truth is.
 
 ## Secrets
