@@ -156,8 +156,9 @@ def test_na_power_range_is_left_to_nvidia_smi(panel):
         return Proc()
 
     panel.ssh = fake_ssh
-    assert panel.set_power({"watts": 150}, "t") == {"ok": True, "watts": 150}
-    assert seen == ["nvidia-smi -pl 150"]
+    out = panel.set_power({"watts": 150}, "t")
+    assert (out["ok"], out["watts"]) == (True, 150)
+    assert seen == ["nvidia-smi -i 0 -pl 150"]
 
 
 def test_power_limit_is_bounded_by_the_card(panel):
@@ -171,6 +172,55 @@ def test_power_limit_is_bounded_by_the_card(panel):
         assert exc.value.detail == "watts must be between 100 and 300"
 
     assert panel.set_power({"watts": 250}, "t")["ok"] is True
+
+
+def test_power_is_applied_to_every_card(panel):
+    stub_gpu(panel, card(index="0"), card(index="1", uuid="GPU-bbbb"))
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+
+    out = panel.set_power({"watts": 250}, "t")
+
+    assert calls == ["nvidia-smi -i 0 -pl 250", "nvidia-smi -i 1 -pl 250"]
+    assert out["ok"] is True
+    assert [c["index"] for c in out["cards"]] == ["0", "1"]
+
+
+def test_a_card_that_refuses_the_limit_is_reported(panel):
+    # Two different cards: the second one tops out below what was asked.
+    stub_gpu(panel, card(index="0"), card(index="1", uuid="GPU-bbbb", power_max="200"))
+
+    def fake_ssh(host, command, timeout=30):
+        if "-i 1" in command:
+            return Proc(returncode=1, stderr="Setting power limit for GPU 0000:02:00.0 failed")
+        return Proc()
+
+    panel.ssh = fake_ssh
+    out = panel.set_power({"watts": 250}, "t")
+
+    assert out["ok"] is False
+    assert out["cards"][0] == {"index": "0", "ok": True}
+    assert out["cards"][1]["error"].startswith("Setting power limit")
+    assert "1 card(s) refused" in panel.state["last_action"]
+
+
+def test_no_card_accepting_the_limit_is_a_502(panel):
+    stub_gpu(panel, card())
+    panel.ssh = lambda host, command, timeout=30: Proc(returncode=1, stderr="not supported")
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.set_power({"watts": 200}, "t")
+    assert exc.value.status_code == 502
+    assert exc.value.detail == "not supported"
+
+
+def test_a_value_outside_every_range_is_refused_before_any_command(panel):
+    stub_gpu(panel, card(index="0", power_max="200"), card(index="1", uuid="GPU-bbbb", power_max="200"))
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.set_power({"watts": 250}, "t")
+    assert exc.value.detail == "watts must be between 100 and 200"
+    assert calls == []
 
 
 def test_a_card_without_a_settable_range_still_reports(panel):

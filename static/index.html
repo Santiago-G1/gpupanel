@@ -494,10 +494,17 @@ $('pl').addEventListener('input', (e) => {
   syncPower();
 });
 
-$('pl-apply').onclick = () => {
+$('pl-apply').onclick = async () => {
   const watts = Number($('pl').value);
   if (last && last.gpu && Number(last.gpu.power_limit) === watts) return skip('The limit is already ' + watts + ' W');
-  act($('pl-apply'), '/api/power', {watts}, {pending: 'Applying ' + watts + ' W…', done: 'Power limit = ' + watts + ' W'});
+  const r = await act($('pl-apply'), '/api/power', {watts},
+    {pending: 'Applying ' + watts + ' W…', done: 'Power limit = ' + watts + ' W'});
+  // 200 means "at least one card took it": say which ones did not.
+  const refused = (r && Array.isArray(r.cards) ? r.cards : []).filter((c) => !c.ok);
+  if (refused.length) {
+    msg(refused.length + ' card(s) refused ' + watts + ' W: ' + refused.map((c) => 'GPU ' + c.index).join(', ')
+        + ' — ' + (refused[0].error || 'nvidia-smi said no'), true);
+  }
 };
 
 $('llama-unload').onclick = () => act($('llama-unload'), '/api/llama/unload', null,

@@ -964,18 +964,34 @@ def set_power(body: dict = Body(...), _: str = Depends(require_auth)):
         watts = int(body.get("watts"))
     except (TypeError, ValueError):
         raise HTTPException(400, "watts must be an integer") from None
-    # The range is the card's, not a constant: a P100 allows 125-250 W and
-    # anything else reports its own limits. A card that reports neither (or
-    # answers `N/A`) is left to nvidia-smi, whose refusal is the honest answer.
-    card = gpu_status()
-    low, high = as_number(card["power_min"], None), as_number(card["power_max"], None)
-    if low is not None and high is not None and not low <= watts <= high:
-        raise HTTPException(400, f"watts must be between {int(low)} and {int(high)}")
-    p = ssh(GPU_HOST, f"nvidia-smi -pl {watts}")
-    if p.returncode != 0:
-        raise HTTPException(502, p.stderr.strip() or p.stdout.strip())
-    record_action(f"power limit = {watts} W")
-    return {"ok": True, "watts": watts}
+    # The range is the cards', not a constant, and two cards in one machine can
+    # differ: validate against the widest range and then let each card answer for
+    # itself, because `nvidia-smi -pl` without `-i` fails as a whole as soon as
+    # one of them does not accept the value.
+    cards = gpu_status()["gpus"]
+    ranges = [(g["index"], as_number(g["power_min"], None), as_number(g["power_max"], None)) for g in cards]
+    known = [(index, low, high) for index, low, high in ranges if low is not None and high is not None]
+    if known:
+        low, high = min(low for _, low, _ in known), max(high for _, _, high in known)
+        if not low <= watts <= high:
+            raise HTTPException(400, f"watts must be between {int(low)} and {int(high)}")
+
+    results = []
+    for index, _, _ in ranges:
+        p = ssh(GPU_HOST, f"nvidia-smi -i {index} -pl {watts}")
+        entry = {"index": index, "ok": p.returncode == 0}
+        if p.returncode != 0:
+            entry["error"] = (p.stderr or p.stdout).strip()[:200] or "nvidia-smi refused the limit"
+        results.append(entry)
+    if not any(entry["ok"] for entry in results):
+        raise HTTPException(502, results[0]["error"])
+
+    refused = [entry["index"] for entry in results if not entry["ok"]]
+    record_action(
+        f"power limit = {watts} W"
+        + (f" ({len(refused)} card(s) refused: {', '.join(refused)})" if refused else "")
+    )
+    return {"ok": not refused, "watts": watts, "cards": results}
 
 
 @app.post("/api/llama/unload")
