@@ -18,6 +18,8 @@ services:
       - PANEL_TOKEN=${PANEL_TOKEN:?PANEL_TOKEN is required}
       # Values come from the rendered .env, never from this file.
       - LLAMA_PUBLIC_MODELS=${LLAMA_PUBLIC_MODELS:-}
+      # How many cards the node should have: 0 reports without judging.
+      - GPU_EXPECTED=${GPU_EXPECTED:-0}
       # Required: the panel's own localhost is not llama.cpp.
       - LLAMA_URL=${LLAMA_URL:?LLAMA_URL is required}
       - PVE_HOST=${PVE_HOST:?PVE_HOST is required}
