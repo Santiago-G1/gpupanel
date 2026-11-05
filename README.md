@@ -98,9 +98,16 @@ The SSH key under `/root/.ssh` must reach `PVE_HOST`, `IMMICH_HOST` and
 `FRONTEND_HOST` non-interactively (`BatchMode=yes` is used throughout), and the
 user on each must be able to run `nvidia-smi`, `docker` and `pct exec`.
 
-In the lab, Ansible (`homelab_WIP`, `roles/stacks`) places this project at
-`/opt/docker/gpu-panel` and renders `.env` from the encrypted vault with mode
-`0600`; the panel itself is never edited on the host.
+In the lab, Ansible (`homelab_WIP`, `roles/stacks`) checks this repository out
+at `/opt/docker/gpu-panel` on the `main` branch and renders `.env` from the
+encrypted vault with mode `0600`. The checkout is the deployed copy, so local
+edits there are discarded on the next run — the panel is never edited on the
+host.
+
+```sh
+# from the homelab repository's ansible/ directory
+ansible-playbook playbooks/stacks.yml --limit ai -e '{"stacks_only":["gpu-panel"]}'
+```
 
 ## API
 
