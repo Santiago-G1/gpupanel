@@ -1,9 +1,14 @@
+# GPU control panel: arbitrates the single P100 between llama.cpp, Immich ML,
+# Jellyfin and ComfyUI. It reaches every one of them over SSH to the host that
+# owns it, so the SSH key is the mount that matters.
 services:
   gpu-panel:
     build: .
     image: gpu-panel:local
     container_name: gpu-panel
     restart: unless-stopped
+    # uvicorn is PID 1 and reaps nothing: `init` takes care of the ssh children.
+    init: true
     ports:
       - "${PUBLISH_PORT:?}:8099"
     environment:
@@ -33,6 +38,19 @@ services:
       - /root/.ssh:/root/.ssh:ro
       # Auto-switch settings survive a recreate.
       - gpu_panel_state:/state
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+    # /api/session answers without credentials and never touches the PVE node,
+    # which makes it the cheapest probe of the process itself.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/api/session', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
 volumes:
   gpu_panel_state:
