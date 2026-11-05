@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU Control · how to use</title>
+<link rel="stylesheet" href="/static/panel.css">
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1 id="host">GPU Control · how to use</h1>
+  <span class="sub">one P100, four consumers</span>
+  <button id="logout" title="End this browser's session">Sign out</button>
+</header>
+<div class="shell">
+<nav class="side">
+  <a href="/">Dashboard</a>
+  <a href="/howto" class="on">How to use</a>
+  <span class="nav-label">On this page</span>
+  <a href="#idea">The idea</a>
+  <a href="#modes">GPU modes</a>
+  <a href="#auto">Auto-switch</a>
+  <a href="#comfy">ComfyUI</a>
+  <a href="#jellyfin">Jellyfin</a>
+  <a href="#logs">llama.cpp logs</a>
+  <a href="#power">Power limit</a>
+  <a href="#api">Automation</a>
+</nav>
+<main>
+
+<h2 id="idea">The idea</h2>
+<div class="card">
+  <div class="k">
+    The Tesla P100 has 16 GB and there are four things that want it: <b>llama.cpp</b>
+    (LLMs, ~15.8 GB with a large model resident), <b>Immich ML</b> (CUDA, ~6.8 GB),
+    <b>Jellyfin NVENC</b> (video transcoding) and <b>ComfyUI</b> (image generation,
+    ~4-6 GB). Only one of the first three can own the card at a time, so the panel
+    arbitrates: it watches what is really running and moves the others out of the way.
+  </div>
+  <div class="k" style="margin-top:8px">
+    Two rules decide everything: <b>llama.cpp comes first</b> (while a model is
+    loading or loaded, the other CUDA consumers step aside) and <b>nothing stays
+    on the card idle</b> (each consumer has a release timer).
+  </div>
+</div>
+
+<h2 id="modes">GPU modes</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>Mode</th><th>What it does</th><th>When</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b>LLM</b></td>
+        <td>Unloads nothing by itself, stops <b>Immich ML</b> and moves Jellyfin to the
+            <b>iGPU</b> (VAAPI), so the P100 belongs to llama.cpp.</td>
+        <td>Chatting with the agent, coding models, long prompts.</td>
+      </tr>
+      <tr>
+        <td><b>Media</b></td>
+        <td>Unloads the llama.cpp models, starts Immich ML and puts Jellyfin on
+            <b>NVENC</b> (the P100).</td>
+        <td>Smart search / face detection batches, 4K transcoding.</td>
+      </tr>
+      <tr>
+        <td><b>Shared</b></td>
+        <td>Immich ML + Jellyfin NVENC <i>without</i> unloading the LLM.</td>
+        <td>Only fits with a small model already loaded; useful for a quick ML job.</td>
+      </tr>
+      <tr>
+        <td><b>Image</b></td>
+        <td>Unloads the LLM, stops Immich ML, moves Jellyfin to the iGPU and
+            <b>starts ComfyUI</b>.</td>
+        <td>Generating images. A diffusion model needs the whole card.</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="k" style="margin-top:10px">
+    The highlighted button on the dashboard is derived from the real state every
+    5 s (which containers are up, where Jellyfin transcodes), not from the last
+    click: if something changed outside the panel, the ring follows.
+  </div>
+</div>
+
+<h2 id="auto">Auto-switch</h2>
+<div class="card">
+  <div class="k">Three timers, all measured from "the GPU has been idle this long"
+    (utilisation 0 %). Set any of them to <b>0</b> to disable that one.</div>
+  <table style="margin-top:10px">
+    <thead><tr><th>Timer</th><th>What happens when it fires</th></tr></thead>
+    <tbody>
+      <tr><td>Release the LLM (<span class="mono">llama_idle_min</span>)</td>
+          <td>The llama.cpp models are unloaded from VRAM and Immich ML comes back, so
+              smart search can run without you clicking anything.</td></tr>
+      <tr><td>Stop Immich ML (<span class="mono">ml_idle_min</span>)</td>
+          <td>Immich ML is stopped when its own job queue is empty (it does not kill a
+              running batch).</td></tr>
+      <tr><td>Release the P100 from ComfyUI (<span class="mono">comfy_idle_min</span>)</td>
+          <td>ComfyUI is stopped once its queue is empty, so the next LLM request finds
+              the card free. This is why Image mode does not need to be undone by hand.</td></tr>
+    </tbody>
+  </table>
+  <div class="k" style="margin-top:10px">
+    The auto-switch is <b>on</b> by default. Turning it off leaves the modes purely
+    manual (the panel still shows the state, it just stops acting on it).
+  </div>
+</div>
+
+<h2 id="comfy">ComfyUI</h2>
+<div class="card">
+  <div class="k">
+    <b>1.</b> Press <b>Image (ComfyUI)</b> on the dashboard (or the ComfyUI card's
+    Start button). The panel frees the card first, then starts the container.<br>
+    <b>2.</b> Open <span class="mono">comfy.&lt;zona&gt;</span> — the URL is on the card.
+    If it answers <b>502</b>, the container is stopped: repeat step 1.<br>
+    <b>3.</b> Drag a workflow from
+    <span class="mono">/mnt/data/image_models/workflows</span> into the canvas, or build
+    one: <b>Unet Loader (GGUF/Advanced)</b> for the unet,
+    <b>DualCLIPLoader</b> (type <span class="mono">sdxl</span>) and <b>VAELoader</b>.<br>
+    <b>4.</b> Generated images land in <span class="mono">/mnt/data/comfyui_output</span>;
+    reference images go in <span class="mono">/mnt/data/comfyui_workspace/ComfyUI/input</span>.
+  </div>
+  <table style="margin-top:12px">
+    <thead><tr><th>Setting</th><th>Leave it as</th></tr></thead>
+    <tbody>
+      <tr><td><span class="mono">dequant_dtype</span> / <span class="mono">patch_dtype</span></td>
+          <td><b>float16</b>. float32 is not faster (the compute dtype is already fp16)
+              and uses more scratch VRAM.</td></tr>
+      <tr><td><span class="mono">patch_on_device</span></td><td><b>off</b> (required input since 2026).</td></tr>
+      <tr><td>Resolution / steps</td>
+          <td>1024² ≈ <b>70 s</b> for 28 steps on this card. 768² ≈ 40 s, 512² ≈ 20 s.</td></tr>
+      <tr><td>ComfyUI-Manager</td>
+          <td><b>Off</b>. It can "update" torch, and torch 2.8+ no longer supports this
+              GPU: the card disappears until the image is rebuilt.</td></tr>
+    </tbody>
+  </table>
+  <div class="k" style="margin-top:10px">
+    The card is compute-bound at 1024² (100 % GPU, ~125 W, only ~4 GB of VRAM in use),
+    so lower quants or offloading do not make it faster. Details:
+    <span class="mono">docs/comfyui.md</span> in the lab repository.
+  </div>
+</div>
+
+<h2 id="jellyfin">Jellyfin</h2>
+<div class="card">
+  <div class="k">
+    <b>NVENC</b> transcodes on the <b>P100</b>; <b>VAAPI</b> on the <b>Intel iGPU</b>
+    (a different device, it costs the P100 nothing). When the LLM takes the card,
+    Jellyfin is moved to VAAPI, never to CPU: transcoding stays hardware-accelerated.
+  </div>
+  <div class="k" style="margin-top:8px">
+    Pick NVENC only when the card is free (Media mode). If playback starts stuttering
+    right after a model load, check this value first: it should read <b>vaapi</b>.
+  </div>
+</div>
+
+<h2 id="logs">llama.cpp logs</h2>
+<div class="card">
+  <div class="k">
+    A tail of the <span class="mono">llama-server</span> systemd unit on the AI
+    container (journald, read through the PVE host). What matters:
+  </div>
+  <div class="k" style="margin-top:8px">
+    <span class="mono">load time = … ms</span> → how long the model took to come up
+    (from the ZFS pool it is ~180 s for the 13.6 GB Q4; cached is much faster).<br>
+    <span class="mono">cudaMalloc failed: out of memory</span> → something else held
+    the VRAM. Check the consumers list: it should never happen in LLM/Image mode,
+    which free the card first.<br>
+    <span class="mono">Xid</span> or <span class="mono">GPU has fallen off the bus</span>
+    → hardware/PCIe problem, the card needs a PVE reboot.
+  </div>
+</div>
+
+<h2 id="power">Power limit</h2>
+<div class="card">
+  <div class="k">
+    The P100 is tuned to <b>165 W</b> (application clock 1328 MHz): 99 % of its
+    throughput at 92 % of the power. Below ~142 W the clock never reaches 1328 MHz,
+    and above ~200 W nothing changes in real inference. Raising it is only worth it
+    for a long sustained prefill; lowering it to 125 W gives ~91 % of the speed.
+    The limit is applied by the PVE host (an unprivileged container cannot set it).
+  </div>
+</div>
+
+<h2 id="api">Automation</h2>
+<div class="card">
+  <div class="k">
+    Everything the buttons do is an API call, with the panel token as a bearer:
+  </div>
+  <pre class="mono" style="margin:10px 0 0; background:#0b0e13; border:1px solid var(--line);
+       border-radius:8px; padding:10px 12px; overflow:auto; font-size:12px; color:#c9d1d9">GET  /api/status
+POST /api/mode/llm|media|balanced|image
+POST /api/comfy/start|stop|restart
+POST /api/auto            {"enabled":true,"llama_idle_min":60,"ml_idle_min":0,"comfy_idle_min":10}
+POST /api/llama/unload
+GET  /api/llama/logs?lines=200
+POST /api/power           {"watts":165}</pre>
+  <div class="k" style="margin-top:10px">
+    <a href="/">← Back to the dashboard</a>
+  </div>
+</div>
+
+</main>
+</div>
+<footer class="mono">GPU Control · how to use</footer>
+<script>
+const el = document.getElementById('host');
+el.textContent = location.hostname + ' · GPU Control · how to use';
+document.title = location.hostname + ' · GPU Control · how to use';
+document.getElementById('logout').onclick = async () => {
+  try { await fetch('/api/logout', {method: 'POST', credentials: 'same-origin'}); } catch (e) {}
+  location.href = '/login';
+};
+</script>
+</body>
+</html>
