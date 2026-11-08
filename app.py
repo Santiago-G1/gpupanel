@@ -826,23 +826,36 @@ def immich_ml_state():
     return p.stdout.strip() or "unknown"
 
 
-def comfy_state():
-    """Whether ComfyUI is up. HTTP first: `pct exec` plus `docker inspect` is
-    over a second of round trip per page load, and ComfyUI answers in five ms.
+# A stopped ComfyUI has no API to answer with, so its state comes from the
+# container: `pct exec` plus `docker inspect` is over a second, and a container
+# does not change state between two dashboard polls. Actions force it.
+COMFY_STATE_TTL = 15
+COMFY_STATE = {"at": 0.0, "value": None}
+
+
+def comfy_state(force=False):
+    """Whether ComfyUI is up. HTTP first: it answers in five ms.
 
     The container is the fallback, because a ComfyUI that is still booting has
-    no API yet but is not stopped either.
+    no API yet but is not stopped either. That fallback is remembered for
+    COMFY_STATE_TTL seconds — and a start/stop/restart asks again.
     """
     if not COMFY:
         return "unconfigured"
     if COMFY_API:
         try:
             httpx.get(f"{COMFY_URL}/system_stats", timeout=3)
+            COMFY_STATE.update({"at": time.time(), "value": "running"})
             return "running"
         except Exception:  # noqa: BLE001 - not answering: ask the container
             pass
+    now = time.time()
+    if not force and COMFY_STATE["value"] and now - COMFY_STATE["at"] < COMFY_STATE_TTL:
+        return COMFY_STATE["value"]
     p = ssh(AI_HOST, ai_cmd(f"docker inspect -f '{{{{.State.Status}}}}' {COMFY_CONTAINER}"))
-    return p.stdout.strip() or "unknown"
+    value = p.stdout.strip() or "unknown"
+    COMFY_STATE.update({"at": now, "value": value})
+    return value
 
 
 def comfy(action):
@@ -853,6 +866,8 @@ def comfy(action):
     p = ssh(AI_HOST, ai_cmd(f"docker {action} {COMFY_CONTAINER}"), timeout=90)
     if p.returncode != 0:
         raise HTTPException(502, p.stderr.strip() or p.stdout.strip())
+    # The remembered state is now wrong on purpose: ask again.
+    comfy_state(force=True)
     return {"action": action, "ok": True}
 
 
@@ -1260,7 +1275,8 @@ def inventory_view(gpus, probe=None):
         "events": list(state.get("gpus_events") or [])[-10:],
         "flapping": flapping,
         "last_change": state.get("gpus_last_change"),
-        "probe": probe_view(probe) if probe is not None else {},
+        # `gpu_status` already reduced the probe to what a client can use.
+        "probe": probe if probe is not None else {},
     }
 
 

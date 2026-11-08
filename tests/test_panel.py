@@ -752,3 +752,28 @@ def test_a_stray_line_does_not_break_the_records(panel):
 
     card = panel.gpu_status()["gpus"][0]
     assert (card["pci"], card["util"]) == ("0000:01:00.0", "5")
+
+
+def test_the_inventory_carries_the_probe_answer(panel):
+    # It used to be reduced twice and the nvidia-smi answer was lost on the way.
+    stub_probe(panel)
+    status = panel.status("t")
+    assert status["inventory"]["probe"]["nvidia_smi"] == "0"
+    assert status["inventory"]["probe"]["host_ok"] is True
+
+
+def test_a_stopped_comfyui_is_not_asked_twice_in_a_row(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, COMFY_CONTAINER="comfyui", COMFY_URL="http://comfy.test")
+
+    def no_api(*args, **kwargs):
+        raise RuntimeError("ComfyUI is stopped")
+
+    monkeypatch.setattr(panel.httpx, "get", no_api)
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc("created\n")
+
+    assert panel.comfy_state() == "created"
+    assert panel.comfy_state() == "created"  # remembered, not asked again
+    assert len(calls) == 1
+    assert panel.comfy_state(force=True) == "created"
+    assert len(calls) == 2
