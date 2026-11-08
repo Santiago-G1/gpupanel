@@ -20,6 +20,7 @@ import secrets
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import httpx
@@ -154,6 +155,16 @@ LLAMA_PUBLIC_MODELS = [m.strip().lower() for m in optional("LLAMA_PUBLIC_MODELS"
 # error anywhere else: nvidia-smi simply lists one card less. 0 = the panel
 # reports what it sees and calls nothing missing.
 GPU_EXPECTED = number("GPU_EXPECTED", 0)
+# The exact set, when a count is not enough: a PCI address (0000:02:00.0) or a
+# UUID per card. Empty falls back to the count above.
+GPU_EXPECTED_IDS = [x.strip() for x in optional("GPU_EXPECTED_IDS").split(",") if x.strip()]
+# Kernel evidence (NVRM, Xid, AER, amdgpu resets) is collected when the card set
+# changes. It is the difference between "a card is gone" and "the card fell off
+# the bus at 03:12", and it costs one SSH only when something happened.
+GPU_EVIDENCE = optional("GPU_EVIDENCE").strip().lower() not in ("0", "false", "no", "off")
+# How many card events the state file keeps. The newest is the one the
+# dashboard shows; the rest is what makes a flapping card visible.
+GPU_EVENTS_MAX = 50
 
 # Delivered base64: the psql quoting does not survive nested shells.
 IMMICH_CFG_SCRIPT = r"""docker exec %s sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "select value from system_metadata where key = '"'"'system-config'"'"';"'"""
@@ -169,12 +180,101 @@ GPU_KEYS = [
     "clk_sm", "clk_mem", "pcie_gen", "pcie_width",
 ]
 
+# PCI vendor ids, which is the only thing every vendor agrees on. The cards are
+# read through the driver that owns them: nvidia-smi for NVIDIA, sysfs for AMD
+# and Intel. Nothing here requires a card to be an NVIDIA one.
+VENDORS = {"0x10de": "nvidia", "0x1002": "amd", "0x8086": "intel"}
+VENDOR_LABEL = {"nvidia": "NVIDIA", "amd": "AMD", "intel": "Intel"}
+
+# One SSH, one report. The sysfs half is vendor-neutral (a card that is not on
+# the bus is not in /sys/class/drm either) and nvidia-smi is what says whether
+# the *driver* sees the cards it can see. When those two disagree the panel can
+# finally tell a dead card from a crashed driver.
+PROBE_SCRIPT = r"""
+# One line, always: a multi-line value would break the record it lives in.
+p() { head -1 "$1" 2>/dev/null || true; }
+# The AER counters are a table; only the total is a reading.
+aer() { awk -v key="$2" '$1 == key { print $2; exit }' "$1" 2>/dev/null; }
+have() { command -v "$1" >/dev/null 2>&1 && echo 1 || echo 0; }
+kv() { printf '\t%s=%s' "$1" "$2"; }
+
+echo "@@tools"
+echo "tool$(kv nvidia-smi "$(have nvidia-smi)")$(kv amd-smi "$(have amd-smi)")$(kv rocm-smi "$(have rocm-smi)")$(kv lspci "$(have lspci)")"
+
+echo "@@sysfs"
+for dev in /sys/class/drm/card[0-9]*/device; do
+  [ -e "$dev/vendor" ] || continue
+  bdf=$(basename "$(readlink -f "$dev" 2>/dev/null)" 2>/dev/null)
+  drm=$(basename "$(dirname "$dev")")
+  drv=$(basename "$(readlink -f "$dev/driver" 2>/dev/null)" 2>/dev/null)
+  nm=$(p "$dev/product_name")
+  if [ -z "$nm" ] && command -v lspci >/dev/null 2>&1; then
+    nm=$(lspci -s "$bdf" 2>/dev/null | head -1 | sed -e 's/^[^ ]* //' -e 's/^[^:]*: //')
+  fi
+  hw=$(ls -d "$dev"/hwmon/hwmon* 2>/dev/null | head -1)
+  echo "card$(kv bdf "$bdf")$(kv drm "$drm")$(kv vendor "$(p "$dev/vendor")")$(kv driver "$drv")$(kv name "$nm")$(kv vram_used "$(p "$dev/mem_info_vram_used")")$(kv vram_total "$(p "$dev/mem_info_vram_total")")$(kv busy "$(p "$dev/gpu_busy_percent")")$(kv temp "$(p "$hw/temp1_input")")$(kv power "$(p "$hw/power1_average")")$(kv cap "$(p "$hw/power1_cap")")$(kv cap_min "$(p "$hw/power1_cap_min")")$(kv cap_max "$(p "$hw/power1_cap_max")")$(kv clk "$(p "$hw/freq1_input")")$(kv clk_mem "$(p "$hw/freq2_input")")$(kv link_speed "$(p "$dev/current_link_speed")")$(kv link_width "$(p "$dev/current_link_width")")$(kv unique_id "$(p "$dev/unique_id")")$(kv aer_fatal "$(aer "$dev/aer_dev_fatal" TOTAL_ERR_FATAL)")$(kv aer_nonfatal "$(aer "$dev/aer_dev_nonfatal" TOTAL_ERR_NONFATAL)")$(kv aer_correctable "$(aer "$dev/aer_dev_correctable" TOTAL_ERR_COR)")"
+done
+
+echo "@@nvinfo"
+for f in /proc/driver/nvidia/gpus/*/information; do
+  [ -e "$f" ] || continue
+  echo "nv$(kv uuid "$(sed -n 's/^GPU UUID:[[:space:]]*//p' "$f" | head -1)")$(kv bdf "$(sed -n 's/^Bus Location:[[:space:]]*//p' "$f" | head -1)")"
+done
+
+# A wedged card can make nvidia-smi hang; the sysfs half has already been
+# printed by then, and the timeout keeps this probe from hanging with it.
+NV=""
+command -v timeout >/dev/null 2>&1 && NV="timeout 10"
+
+echo "@@gpu"
+if command -v nvidia-smi >/dev/null 2>&1; then
+  out=$($NV nvidia-smi --query-gpu=@FIELDS@ --format=csv,noheader,nounits 2>&1); rc=$?
+  printf '%s\n' "$out"
+else
+  rc=127
+fi
+echo "@@gpu_rc"
+printf '%s\n' "$rc"
+
+echo "@@procs"
+if command -v nvidia-smi >/dev/null 2>&1; then
+  out=$($NV nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader,nounits 2>&1); rc=$?
+  printf '%s\n' "$out"
+else
+  rc=127
+fi
+echo "@@procs_rc"
+printf '%s\n' "$rc"
+
+echo "@@end"
+"""
+
 # comfy_idle_min: with an empty queue and an idle card, the GPU goes back to
 # llama.cpp by itself. 0 disables the timer.
 #
 # gpus_known is the baseline the inventory is compared against, gpus_names keeps
-# the names of cards that have since disappeared.
-DEFAULTS = {"enabled": True, "llama_idle_min": 60, "ml_idle_min": 0, "comfy_idle_min": 10, "last_action": None, "last_action_at": None, "revoked": {}, "jellyfin_before_llm": None, "gpus_known": None, "gpus_names": {}, "gpus_last_change": None}
+# what is known about every card ever seen (name, PCI address, UUID) including
+# the ones that have since disappeared, gpus_events is a short history and
+# gpus_down is the cards that are missing right now with the moment they went.
+# last_busy is persisted so a container restart does not reset the idle timer.
+DEFAULTS = {
+    "enabled": True,
+    "llama_idle_min": 60,
+    "ml_idle_min": 0,
+    "comfy_idle_min": 10,
+    "last_action": None,
+    "last_action_at": None,
+    "revoked": {},
+    "jellyfin_before_llm": None,
+    "gpus_known": None,
+    "gpus_names": {},
+    "gpus_last_change": None,
+    "gpus_events": [],
+    "gpus_down": {},
+    "gpus_blind": [],
+    "gpus_aer": {},
+    "last_busy": None,
+}
 
 
 log = logging.getLogger("gpu-panel")
@@ -183,7 +283,10 @@ log = logging.getLogger("gpu-panel")
 SESSION_KEY = hashlib.sha256(f"session|{PANEL_PASSWORD}|{PANEL_TOKEN}".encode()).digest()
 
 state = dict(DEFAULTS)
-STATE_LOCK = threading.Lock()
+# Reentrant: record_action() takes it and then saves, which takes it again.
+STATE_LOCK = threading.RLock()
+# The consumer probes are independent SSH/HTTP round trips; run them at once.
+PROBE_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="probe")
 last_busy = time.time()
 llm_blocked = False
 
@@ -216,8 +319,12 @@ def load_state():
     except Exception as exc:  # noqa: BLE001 - a bad file must not stop the panel
         log.warning("ignoring %s: %s", STATE_PATH, exc)
         return
+    global last_busy
     with STATE_LOCK:
         state.update({k: v for k, v in stored.items() if k in DEFAULTS})
+    if state.get("last_busy"):
+        # A restart is not an idle period: keep counting from before it.
+        last_busy = float(state["last_busy"])
 
 
 def save_state():
@@ -331,14 +438,42 @@ def run(cmd, timeout=30, **kwargs):
         return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
 
+def gather_probes(jobs):
+    """Run independent probes at once and keep every answer, including failures.
+
+    They are separate SSH and HTTP round trips with nothing in common, and the
+    dashboard asks for all of them every five seconds: one after another was
+    2.3 s per page load, most of it waiting.
+    """
+    futures = {name: PROBE_POOL.submit(job) for name, job in jobs.items()}
+    out = {}
+    for name, future in futures.items():
+        try:
+            out[name] = future.result(timeout=90)
+        except Exception as exc:  # noqa: BLE001 - a failed probe is an answer
+            out[name] = exc
+    return out
+
+
 def llama_request(method, path, **kwargs):
     """A call to the router, with the key if one is configured."""
     kwargs.setdefault("timeout", 8)
     return httpx.request(method, f"{LLAMA_URL}{path}", headers=dict(LLAMA_HEADERS), **kwargs)
 
 
+# One TCP session, reused: every probe is 6 SSH calls and a fresh handshake is
+# ~150 ms each. `%C` is a hash of host/user/port, so the path stays short.
+SSH_OPTS = [
+    "-o", "BatchMode=yes",
+    "-o", "ConnectTimeout=6",
+    "-o", "ControlMaster=auto",
+    "-o", "ControlPath=/tmp/gpu-panel-%C",
+    "-o", "ControlPersist=60",
+]
+
+
 def ssh(host, command, timeout=30):
-    return run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", host, command], timeout)
+    return run(["ssh", *SSH_OPTS, host, command], timeout)
 
 
 def ai_cmd(command):
@@ -348,54 +483,286 @@ def ai_cmd(command):
 
 def ssh_script(host, script, timeout=60):
     payload = base64.b64encode(script.encode()).decode()
-    return run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", host, "base64 -d | sh"],
-        timeout,
-        input=payload,
-    )
+    return run(["ssh", *SSH_OPTS, host, "base64 -d | sh"], timeout, input=payload)
 
 
-def gpu_status():
-    """Every card, plus the single-card shape the power controls still read.
+def _tidy(value, scale=1, digits=None):
+    """A sysfs number as the string nvidia-smi would have printed, or `N/A`.
 
-    `gpu` stays GPU 0 for backwards compatibility and `gpus` carries the list.
-    Processes are attributed by UUID: without that the second card looks idle.
+    The dashboard was written against nvidia-smi's strings and keeps working on
+    them: the AMD half of the probe produces the same ones, in the same units.
     """
-    p = ssh(GPU_HOST, f"nvidia-smi --query-gpu={GPU_FIELDS} --format=csv,noheader,nounits")
-    if p.returncode != 0:
-        raise HTTPException(502, f"nvidia-smi failed: {p.stderr.strip() or p.stdout.strip()}")
-    gpus = []
-    for line in p.stdout.splitlines():
-        parts = [v.strip() for v in line.split(",")]
-        if len(parts) != len(GPU_KEYS):
-            continue
-        gpu = dict(zip(GPU_KEYS, parts, strict=True))
-        gpu["processes"] = []
-        gpus.append(gpu)
-    if not gpus:
-        raise HTTPException(502, "nvidia-smi returned no GPUs")
+    try:
+        raw = float(str(value).strip())
+    except (TypeError, ValueError):
+        return "N/A"
+    scaled = raw / scale
+    return str(int(round(scaled))) if digits is None else f"{scaled:.{digits}f}"
 
-    pr = ssh(GPU_HOST,
-             "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory "
-             "--format=csv,noheader,nounits")
-    by_uuid = {g["uuid"]: g for g in gpus}
-    for line in pr.stdout.splitlines():
-        parts = [x.strip() for x in line.split(",")]
-        if len(parts) != 4 or not parts[1].isdigit():
+
+def _pcie_gen(speed):
+    """`16.0 GT/s PCIe` -> `4`. AMD reports the rate, not the generation."""
+    for rate, gen in (("2.5", "1"), ("5.0", "2"), ("8.0", "3"), ("16.0", "4"), ("32.0", "5"), ("64.0", "6")):
+        if str(speed or "").strip().startswith(rate):
+            return gen
+    return "N/A"
+
+
+def _fields(parts):
+    """The `k=v` fields of one probe line, without trusting any of them."""
+    out = {}
+    for item in parts:
+        key, sep, value = item.partition("=")
+        if sep and key:
+            out[key] = value
+    return out
+
+
+def _aer(raw):
+    """PCIe error counters for one card, when the kernel exposes them."""
+    counters = {name: _tidy(raw.get(f"aer_{name}")) for name in ("fatal", "nonfatal", "correctable")}
+    if all(value == "N/A" for value in counters.values()):
+        return None
+    return counters
+
+
+def parse_probe(text):
+    """The probe's sections. Anything unrecognised is dropped, not trusted."""
+    sections = {"tools": {}, "sysfs": [], "nvinfo": [], "gpu": [], "procs": [], "rc": {}}
+    current = ""
+    for line in text.splitlines():
+        if line.startswith("@@"):
+            current = line[2:].strip()
             continue
-        proc = {"pid": parts[1], "name": parts[2], "mem_mib": int(parts[3])}
+        if current == "tools" and line.startswith("tool\t"):
+            sections["tools"].update({k: v == "1" for k, v in _fields(line.split("\t")[1:]).items()})
+        elif current == "sysfs" and line.startswith("card\t"):
+            sections["sysfs"].append(_fields(line.split("\t")[1:]))
+        elif current == "nvinfo" and line.startswith("nv\t"):
+            sections["nvinfo"].append(_fields(line.split("\t")[1:]))
+        elif current == "gpu":
+            sections["gpu"].append(line)
+        elif current == "procs":
+            sections["procs"].append(line)
+        elif current.endswith("_rc") and line.strip():
+            sections["rc"][current[: -len("_rc")]] = line.strip()
+    return sections
+
+
+def sysfs_card(raw, vendor, tools):
+    """A card read from sysfs: no vendor tool, no ROCm, no driver-specific code.
+
+    AMD exposes everything the dashboard shows through /sys/class/drm, which is
+    in the kernel and not in ROCm. Intel exposes presence and its driver; the
+    panel reports it because Jellyfin's VAAPI fallback depends on that GPU, and
+    not drawing it was the panel lying about the machine.
+    """
+    cap_min, cap_max = raw.get("cap_min"), raw.get("cap_max")
+    setter = None
+    if vendor == "amd" and _tidy(cap_min) != "N/A" and _tidy(cap_max) != "N/A":
+        setter = "amd-smi" if tools.get("amd-smi") else ("rocm-smi" if tools.get("rocm-smi") else None)
+    return {
+        "index": str(raw.get("drm") or "").removeprefix("card") or None,
+        # The UUID is what nvidia-smi calls identity; amdgpu has `unique_id` and
+        # the PCI address is the one every vendor has.
+        "uuid": raw.get("unique_id") or raw.get("bdf") or None,
+        "pci": raw.get("bdf") or "",
+        "vendor": vendor,
+        "name": raw.get("name") or VENDOR_LABEL.get(vendor, "GPU"),
+        "driver": raw.get("driver") or "",
+        "mem_used": _tidy(raw.get("vram_used"), 2**20),
+        "mem_total": _tidy(raw.get("vram_total"), 2**20),
+        "util": _tidy(raw.get("busy")),
+        "temp": _tidy(raw.get("temp"), 1000),
+        "power_draw": _tidy(raw.get("power"), 10**6),
+        "power_limit": _tidy(raw.get("cap"), 10**6, 2),
+        "power_default": "N/A",
+        "power_min": _tidy(raw.get("cap_min"), 10**6),
+        "power_max": _tidy(raw.get("cap_max"), 10**6),
+        "clk_sm": _tidy(raw.get("clk"), 10**6),
+        "clk_mem": _tidy(raw.get("clk_mem"), 10**6),
+        "pcie_gen": _pcie_gen(raw.get("link_speed")),
+        "pcie_width": _tidy(raw.get("link_width")),
+        "processes": [],
+        "bus_visible": True,
+        "driver_visible": bool(raw.get("driver")),
+        "power_settable": bool(setter),
+        "setter": setter,
+        "aer": _aer(raw),
+    }
+
+
+def build_cards(sections):
+    """One card list from the two views the probe returns, and the errors.
+
+    nvidia-smi is the driver's view and sysfs is the bus's. A card in both is a
+    healthy card; a card only on the bus is one the driver lost (`Xid 79`, a
+    crashed module); a card in neither is off the bus. The list keeps the two
+    flags so the dashboard can say which of the three happened.
+    """
+    tools = sections["tools"]
+    errors = []
+    bus = {raw["bdf"]: raw for raw in sections["sysfs"] if raw.get("bdf")}
+    # /proc/driver/nvidia is the only place that ties nvidia-smi's UUID to the
+    # PCI address the bus reports, and both directions are needed: one to attach
+    # the address to the driver's row, the other to keep the UUID of a card the
+    # driver stopped listing.
+    uuid_by_bdf = {r["bdf"]: r["uuid"] for r in sections["nvinfo"] if r.get("bdf") and r.get("uuid")}
+    bdf_by_uuid = {r["uuid"]: r["bdf"] for r in sections["nvinfo"] if r.get("bdf") and r.get("uuid")}
+    cards = []
+    claimed = set()
+
+    for line in sections["gpu"]:
+        parts = [value.strip() for value in line.split(",")]
+        if len(parts) != len(GPU_KEYS):
+            if line.strip():
+                # `Unable to determine the device handle for GPU 0000:01:00.0:
+                # GPU is lost.` lands here, and it is evidence, not noise.
+                errors.append(line.strip()[:300])
+            continue
+        card = dict(zip(GPU_KEYS, parts, strict=True))
+        card["pci"] = bdf_by_uuid.get(card.get("uuid")) or ""
+        card["vendor"] = "nvidia"
+        card["bus_visible"] = (card["pci"] in bus) if card["pci"] else None
+        card["driver_visible"] = True
+        card["setter"] = "nvidia-smi" if tools.get("nvidia-smi", True) else None
+        card["power_settable"] = (
+            as_number(card.get("power_min"), None) is not None
+            and as_number(card.get("power_max"), None) is not None
+        )
+        card["aer"] = _aer(bus.get(card["pci"]) or {})
+        card["processes"] = []
+        if card["pci"]:
+            claimed.add(card["pci"])
+        cards.append(card)
+
+    by_uuid = {card.get("uuid"): card for card in cards}
+    for line in sections["procs"]:
+        parts = [value.strip() for value in line.split(",")]
+        if len(parts) != 4 or not parts[1].isdigit():
+            if line.strip():
+                errors.append(line.strip()[:200])
+            continue
+        proc = {"pid": parts[1], "name": parts[2], "mem_mib": int(parts[3]) if parts[3].isdigit() else 0}
         target = by_uuid.get(parts[0])
         if target is not None:
             proc["gpu"] = target["index"]
             target["processes"].append(proc)
 
-    gpu = gpus[0]
+    for bdf, raw in bus.items():
+        if bdf in claimed:
+            continue
+        vendor = VENDORS.get(str(raw.get("vendor") or "").lower(), "unknown")
+        card = sysfs_card(raw, vendor, tools)
+        if uuid_by_bdf.get(bdf):
+            card["uuid"] = uuid_by_bdf[bdf]
+        if vendor == "nvidia":
+            # On the bus, invisible to nvidia-smi: this is a card the driver
+            # gave up on, not a card that is missing from the machine.
+            card["driver_visible"] = False
+        cards.append(card)
+
+    order = {"nvidia": 0, "amd": 1, "intel": 2}
+    cards.sort(key=lambda card: (order.get(card.get("vendor"), 3), as_number(card.get("index"), 99)))
+    return cards, errors
+
+
+def power_command(card, watts):
+    """The vendor command that sets a power limit, or None when there is none.
+
+    NVIDIA answers to `nvidia-smi -i <index> -pl`. AMD answers to `amd-smi set`
+    when that tool is installed, and to the older `rocm-smi --setpoweroverdrive`
+    (one machine-wide value, not one per card) when it is not. Intel exposes no
+    power cap at all, and that is not a failure: it is a card the dashboard must
+    not offer a slider for.
+    """
+    setter = card.get("setter")
+    if setter is None:
+        setter = "nvidia-smi" if card.get("vendor") in (None, "nvidia") else ""
+    index = card.get("index")
+    if setter == "nvidia-smi" and index is not None:
+        return f"nvidia-smi -i {index} -pl {watts}"
+    if setter == "amd-smi" and index is not None:
+        return f"amd-smi set -g {index} --power-cap {watts}"
+    if setter == "rocm-smi":
+        return f"rocm-smi --setpoweroverdrive {watts}"
+    return None
+
+
+def probe_cards():
+    """Every card, or why there are none. This one does not raise.
+
+    A host that answers with zero cards is not a broken host: it is a machine
+    whose driver is unloaded or whose cards are gone, and that is the event the
+    inventory exists to record. Only a host that cannot be read at all is an
+    error, and it is raised by `gpu_status`.
+    """
+    p = ssh_script(GPU_HOST, PROBE_SCRIPT.replace("@FIELDS@", GPU_FIELDS), timeout=30)
+    text = p.stdout or ""
+    if "@@end" not in text:
+        detail = (p.stderr or p.stdout or "").strip().splitlines()
+        return {
+            "host_ok": False,
+            "cards": [],
+            "errors": [detail[-1][:300]] if detail else [f"the probe returned nothing (exit {p.returncode})"],
+            "tools": {},
+            "rc": {},
+        }
+    sections = parse_probe(text)
+    cards, errors = build_cards(sections)
+    return {
+        "host_ok": True,
+        "cards": cards,
+        "errors": errors,
+        "tools": sections["tools"],
+        "rc": sections["rc"],
+    }
+
+
+def probe_view(probe):
+    """The part of a probe that belongs in /api/status: what failed and why."""
+    return {
+        "host_ok": probe.get("host_ok"),
+        "tools": probe.get("tools") or {},
+        "errors": list(probe.get("errors") or [])[:5],
+        "nvidia_smi": (probe.get("rc") or {}).get("gpu"),
+    }
+
+
+def single_card(cards, probe=None):
+    """The first card, with every card attached: what the controls read."""
+    if not cards:
+        empty = dict.fromkeys(GPU_KEYS, "N/A")
+        empty.update({
+            "index": None, "uuid": None, "name": "no cards", "driver": "", "vendor": None,
+            "pci": "", "processes": [], "util_max": 0, "power_limits": [], "gpus": [],
+            "power_settable": False, "bus_visible": None, "driver_visible": None,
+        })
+        if probe is not None:
+            empty["probe"] = probe_view(probe)
+        return empty
+    gpu = dict(cards[0])
     # A card is busy if any card is busy. `N/A` counts as idle here: nothing is
     # being computed, and it must not be read as a number.
-    gpu["util_max"] = max(int(as_number(g["util"])) for g in gpus)
-    gpu["power_limits"] = [g["power_limit"] for g in gpus]
-    gpu["gpus"] = gpus
+    gpu["util_max"] = max(int(as_number(card.get("util"))) for card in cards)
+    gpu["power_limits"] = [card.get("power_limit") for card in cards]
+    gpu["gpus"] = cards
+    if probe is not None:
+        gpu["probe"] = probe_view(probe)
     return gpu
+
+
+def gpu_status():
+    """Every card, plus the single-card shape the power controls still read.
+
+    Processes are attributed by UUID: without that the second card looks idle.
+    Zero cards is not a 502: the inventory turns it into an event with a time.
+    """
+    probe = probe_cards()
+    if not probe["host_ok"]:
+        errors = probe.get("errors") or ["no answer"]
+        raise HTTPException(502, f"card probe failed: {errors[0]}")
+    return single_card(probe["cards"], probe)
 
 
 def llama_models():
@@ -460,8 +827,20 @@ def immich_ml_state():
 
 
 def comfy_state():
+    """Whether ComfyUI is up. HTTP first: `pct exec` plus `docker inspect` is
+    over a second of round trip per page load, and ComfyUI answers in five ms.
+
+    The container is the fallback, because a ComfyUI that is still booting has
+    no API yet but is not stopped either.
+    """
     if not COMFY:
         return "unconfigured"
+    if COMFY_API:
+        try:
+            httpx.get(f"{COMFY_URL}/system_stats", timeout=3)
+            return "running"
+        except Exception:  # noqa: BLE001 - not answering: ask the container
+            pass
     p = ssh(AI_HOST, ai_cmd(f"docker inspect -f '{{{{.State.Status}}}}' {COMFY_CONTAINER}"))
     return p.stdout.strip() or "unknown"
 
@@ -626,73 +1005,262 @@ def record_action(text):
     save_state()
 
 
-def _short(uuid):
-    """The part of a PCI UUID that tells two identical cards apart.
+def card_key(card):
+    """Which card this is, in a way the vendor does not change.
+
+    NVIDIA has UUIDs and they are the best identity there is, but they come
+    from the driver: a card the driver stopped seeing loses its UUID too, and
+    keying on it would read as a removal plus an arrival. The PCI address is on
+    the bus and is what the absence of a card looks like, so it is the fallback
+    that makes those two cases the same card. AMD and Intel are keyed on it
+    directly.
+    """
+    uuid = str(card.get("uuid") or "").strip()
+    if card.get("vendor") in (None, "nvidia") and uuid.startswith(("GPU-", "MIG-")):
+        return uuid
+    pci = str(card.get("pci") or "").strip()
+    if pci and pci != "N/A":
+        return pci
+    if uuid and uuid != "N/A":
+        return uuid
+    return "?"
+
+
+def _short(key):
+    """The part of an identity that tells two identical cards apart.
 
     A PCI UUID is `GPU-<serial>-<more>`, but a MIG device is `MIG-<parent>-...`
     and the serial is not always the same length: cut at the dash instead of at
-    a fixed offset, which used to leave `bbbb-222` in a message.
+    a fixed offset, which used to leave `bbbb-222` in a message. A PCI address
+    is already short and is printed whole.
     """
-    text = str(uuid)
-    parts = text.split("-")
-    serial = parts[1] if len(parts) > 1 else text
-    return serial[:12] or text
+    text = str(key)
+    if text.startswith(("GPU-", "MIG-")):
+        parts = text.split("-")
+        return (parts[1] if len(parts) > 1 else text)[:12] or text
+    return text[:12]
+
+
+def _meta(key, value):
+    """What is known about a card: dicts now, plain names in older state files."""
+    if isinstance(value, dict):
+        uuid = value.get("uuid") or (key if str(key).startswith(("GPU-", "MIG-")) else "")
+        return {"name": value.get("name") or "GPU", "pci": value.get("pci") or "",
+                "uuid": uuid, "vendor": value.get("vendor") or ""}
+    uuid = key if str(key).startswith(("GPU-", "MIG-")) else ""
+    return {"name": value or "GPU", "pci": "", "uuid": uuid, "vendor": ""}
+
+
+def gpu_evidence():
+    """Kernel lines that explain a card that just changed.
+
+    `Xid 79` is a card that fell off the bus, an `amdgpu` ring reset is a driver
+    that gave up, and `pcieport` AER lines are the link: the panel cannot fix
+    any of it, but it cannot call them the same thing either. One SSH, and only
+    when something actually changed.
+    """
+    if not GPU_EVIDENCE:
+        return []
+    p = ssh(
+        GPU_HOST,
+        "journalctl -k --since '-10 min' -o short-iso --no-pager 2>/dev/null "
+        "| grep -Ei 'NVRM|Xid|AER|pcieport|amdgpu.*(error|reset|ring)' | tail -20",
+        timeout=20,
+    )
+    return [line.strip() for line in (p.stdout or "").splitlines() if line.strip()][-20:]
 
 
 def track_gpus(gpus):
     """Remember the card set, and record the moment it changes.
 
-    A card that fails to initialise is silent: no driver error reaches the
-    panel, `nvidia-smi` just answers with one card fewer, and every consumer on
-    the remaining card still works. Comparing UUIDs with the previous look is
-    what turns that silence into an event with a timestamp.
+    Two card views matter and they fail differently: a card that is not on the
+    bus is gone from /sys/class/drm as well (hardware, power, riser), while a
+    card the driver stopped seeing is still there with its PCI address (`Xid
+    79`, a crashed nvidia module). The event says which one happened, when, and
+    with the kernel lines that go with it.
 
     The first observation after a fresh state file is the baseline, not news.
     """
-    uuids = [g["uuid"] for g in gpus]
-    names = {g["uuid"]: g.get("name", "GPU") for g in gpus}
+    keys = [card_key(card) for card in gpus]
+    meta = {
+        card_key(card): {
+            "name": card.get("name") or "GPU",
+            "pci": card.get("pci") or "",
+            "uuid": str(card.get("uuid") or ""),
+            "vendor": card.get("vendor") or "",
+        }
+        for card in gpus
+    }
+    aers = {card_key(card): card.get("aer") for card in gpus if card.get("aer")}
+    if aers:
+        state["gpus_aer"] = {**(state.get("gpus_aer") or {}), **aers}
+
     known = state.get("gpus_known")
     if known is None:
-        state["gpus_known"] = uuids
-        state["gpus_names"] = names
+        with STATE_LOCK:
+            state["gpus_known"] = keys
+            state["gpus_names"] = meta
+            state["gpus_down"] = {}
+            state["gpus_blind"] = sorted(k for k, v in zip(keys, gpus, strict=True) if v.get("driver_visible") is False)
         save_state()
         return
-    if sorted(uuids) == sorted(known):
+
+    at = time.strftime("%Y-%m-%d %H:%M:%S")
+    now = time.time()
+    seen = {key: _meta(key, value) for key, value in (state.get("gpus_names") or {}).items()}
+
+    added = [card for card in gpus if card_key(card) not in known]
+    removed = [key for key in known if key not in keys]
+    blind_now = sorted(card_key(card) for card in gpus if card.get("driver_visible") is False)
+    blind_before = sorted(state.get("gpus_blind") or [])
+    went_blind = [key for key in blind_now if key not in blind_before]
+    came_back = [key for key in blind_before if key not in blind_now and key in keys]
+    with STATE_LOCK:
+        state["gpus_blind"] = blind_now
+    if not (added or removed or went_blind or came_back):
         # Same cards, maybe reported in another order: not a change.
         return
-    seen = dict(state.get("gpus_names") or {})
-    added = [{"uuid": u, "name": names[u]} for u in uuids if u not in known]
-    removed = [{"uuid": u, "name": seen.get(u, "GPU")} for u in known if u not in uuids]
-    state["gpus_known"] = uuids
-    state["gpus_names"] = {**{u: seen[u] for u in known if u in seen}, **names}
-    state["gpus_last_change"] = {
-        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "added": added,
-        "removed": removed,
-        "count": len(uuids),
-    }
+
+    evidence = gpu_evidence()
+    events = []
+    down = dict(state.get("gpus_down") or {})
+    for key in removed:
+        info = seen.get(key) or _meta(key, "GPU")
+        previous = down.get(key) or {}
+        down[key] = {
+            "key": key,
+            "uuid": info.get("uuid") or "",
+            "pci": info.get("pci") or "",
+            "name": info.get("name") or "GPU",
+            "vendor": info.get("vendor") or "",
+            # `since` survives the event history, so a card that stays gone
+            # says for how long instead of only when it was noticed.
+            "since": previous.get("since") or at,
+            "since_ts": previous.get("since_ts") or now,
+            "lost": int(previous.get("lost") or 0) + 1,
+            "aer": previous.get("aer") or (state.get("gpus_aer") or {}).get(key),
+        }
+        events.append({**{k: down[key][k] for k in ("key", "uuid", "pci", "name", "vendor")},
+                       "at": at, "ts": now, "kind": "removed", "count": len(keys), "evidence": evidence})
+    for card in added:
+        key = card_key(card)
+        down.pop(key, None)
+        events.append({
+            "at": at, "ts": now, "kind": "added", "key": key, "uuid": str(card.get("uuid") or ""),
+            "pci": card.get("pci") or "", "name": card.get("name") or "GPU",
+            "vendor": card.get("vendor") or "", "count": len(keys),
+            "evidence": evidence if removed else None,
+        })
+    for key in went_blind:
+        info = meta.get(key) or seen.get(key) or _meta(key, "GPU")
+        events.append({"at": at, "ts": now, "kind": "blind", "key": key, "uuid": info.get("uuid") or "",
+                       "pci": info.get("pci") or "", "name": info.get("name") or "GPU",
+                       "vendor": info.get("vendor") or "", "count": len(keys), "evidence": evidence})
+    for key in came_back:
+        info = meta.get(key) or seen.get(key) or _meta(key, "GPU")
+        down.pop(key, None)
+        events.append({"at": at, "ts": now, "kind": "visible", "key": key, "uuid": info.get("uuid") or "",
+                       "pci": info.get("pci") or "", "name": info.get("name") or "GPU",
+                       "vendor": info.get("vendor") or "", "count": len(keys)})
+
+    def listed(kind):
+        return [{"key": e["key"], "uuid": e["uuid"], "name": e["name"], "pci": e["pci"]}
+                for e in events if e["kind"] == kind]
+
+    with STATE_LOCK:
+        state["gpus_known"] = keys
+        # A card that is gone keeps its name, which is what makes the next
+        # "lost" message readable.
+        state["gpus_names"] = {**{key: value for key, value in seen.items() if key in keys or key in down}, **meta}
+        state["gpus_down"] = down
+        state["gpus_events"] = (list(state.get("gpus_events") or []) + events)[-GPU_EVENTS_MAX:]
+        state["gpus_last_change"] = {
+            "at": at,
+            "count": len(keys),
+            "added": listed("added"),
+            "removed": listed("removed"),
+        }
+
     def label(cards):
-        return ", ".join(f"{g['name']} ({_short(g['uuid'])})" for g in cards)
+        return ", ".join(f"{card['name']} ({_short(card['key'])})" for card in cards)
 
     parts = []
     if added:
-        parts.append(f"{len(added)} new GPU: {label(added)}")
+        parts.append(f"{len(added)} new GPU: {label(listed('added'))}")
     if removed:
-        parts.append(f"{len(removed)} GPU lost: {label(removed)}")
-    record_action(f"cards changed (now {len(uuids)}): {'; '.join(parts)}")
+        parts.append(f"{len(removed)} GPU lost: {label(listed('removed'))}")
+    if went_blind:
+        parts.append(f"{len(went_blind)} GPU on the bus but not in the driver: {label(listed('blind'))}")
+    record_action(f"cards changed (now {len(keys)}): {'; '.join(parts)}")
 
 
-def inventory_view(gpus):
-    """What the dashboard needs to say whether the card set is complete."""
+def inventory_view(gpus, probe=None):
+    """What the dashboard needs to say whether the card set is complete.
+
+    `missing` is the count the settings promise; `absent` is the same idea with
+    the identity and the moment each card went, which is the only version that
+    can be acted on. `state` turns the three into one word.
+    """
+    keys = {card_key(card) for card in gpus}
+    now = time.time()
+    down = {key: value for key, value in (state.get("gpus_down") or {}).items() if key not in keys}
+    absent = []
+    for key, info in down.items():
+        since_ts = info.get("since_ts") or now
+        absent.append({
+            **info,
+            "seconds": int(max(0, now - since_ts)),
+            "wanted": bool(GPU_EXPECTED_IDS) and key in GPU_EXPECTED_IDS,
+        })
+    # A card the settings require and this machine has never shown is not an
+    # absence with a timestamp: it is a card that has never been there, and the
+    # dashboard has to be able to say exactly that.
+    seen = set(state.get("gpus_known") or []) | set((state.get("gpus_names") or {}).keys())
+    for wanted in GPU_EXPECTED_IDS:
+        if wanted in keys or wanted in down or wanted in seen:
+            continue
+        absent.append({
+            "key": wanted, "uuid": "" if not wanted.startswith(("GPU-", "MIG-")) else wanted,
+            "pci": "" if wanted.startswith(("GPU-", "MIG-")) else wanted,
+            "name": "not seen", "since": None, "seconds": None, "wanted": True, "lost": 0,
+        })
+    absent.sort(key=lambda info: info.get("since_ts") or 0)
+    # A card that comes and goes is a different problem from a card that is
+    # gone, and the history is the only place that remembers the difference.
+    drops = {}
+    for event in state.get("gpus_events") or []:
+        if event.get("kind") in ("removed", "blind") and float(event.get("ts") or 0) >= now - 3600:
+            drops[event["key"]] = drops.get(event["key"], 0) + 1
+    flapping = []
+    for key, count in drops.items():
+        if count < 3:
+            continue
+        known = (state.get("gpus_names") or {}).get(key)
+        flapping.append({"key": key, "name": _meta(key, known)["name"] if known else "GPU", "lost": count})
+    count = len(gpus)
+    missing = max(0, GPU_EXPECTED - count) if GPU_EXPECTED else len(absent)
+    health = "empty" if count == 0 else ("partial" if (missing or absent or flapping) else "ok")
     return {
-        "count": len(gpus),
+        "count": count,
         "expected": GPU_EXPECTED,
-        "missing": max(0, GPU_EXPECTED - len(gpus)) if GPU_EXPECTED else 0,
+        "expected_ids": GPU_EXPECTED_IDS,
+        "missing": missing,
+        "state": health,
         "present": [
-            {"uuid": g["uuid"], "index": g.get("index"), "name": g.get("name")}
-            for g in gpus
+            {
+                "key": card_key(card), "uuid": card.get("uuid"), "index": card.get("index"),
+                "name": card.get("name"), "pci": card.get("pci"), "vendor": card.get("vendor"),
+                "driver": card.get("driver"), "bus_visible": card.get("bus_visible"),
+                "driver_visible": card.get("driver_visible"),
+                "power_settable": card.get("power_settable"), "aer": card.get("aer"),
+            }
+            for card in gpus
         ],
+        "absent": absent,
+        "events": list(state.get("gpus_events") or [])[-10:],
+        "flapping": flapping,
         "last_change": state.get("gpus_last_change"),
+        "probe": probe_view(probe) if probe is not None else {},
     }
 
 
@@ -706,6 +1274,11 @@ def auto_tick():
     util = gpu["util_max"]
     if util > 0:
         last_busy = time.time()
+        # Written down at most once a minute: a container restart used to reset
+        # the idle timer, so a panel that came back saw "idle since now".
+        if last_busy - float(state.get("last_busy") or 0) > 60:
+            state["last_busy"] = last_busy
+            save_state()
     if not state["enabled"]:
         return
     idle = time.time() - last_busy
@@ -803,14 +1376,45 @@ def howto(request: Request):
     return FileResponse(os.path.join(APP_DIR, "static", "howto.html"), headers=NO_STORE)
 
 
+# Guessing the password from the LAN is slow already (LOGIN_DELAY); this makes
+# it stop instead. In memory on purpose: a restart is not a reason to forget.
+LOGIN_MAX_FAILURES = number("LOGIN_MAX_FAILURES", 5)
+LOGIN_WINDOW = number("LOGIN_WINDOW", 300)
+LOGIN_FAILURES = {}
+LOGIN_LOCK = threading.Lock()
+
+
+def login_throttled(where):
+    """True when this caller has used up its failures in the window."""
+    if not LOGIN_MAX_FAILURES:
+        return False
+    now = time.time()
+    with LOGIN_LOCK:
+        recent = [when for when in LOGIN_FAILURES.get(where, []) if now - when < LOGIN_WINDOW]
+        LOGIN_FAILURES[where] = recent
+        return len(recent) >= LOGIN_MAX_FAILURES
+
+
+def login_failed(where):
+    with LOGIN_LOCK:
+        LOGIN_FAILURES.setdefault(where, []).append(time.time())
+
+
 @app.post("/api/login")
 def login(request: Request, body: dict = Body(...)):
+    client = getattr(request, "client", None)
+    where = getattr(client, "host", None) or "unknown"
+    if login_throttled(where):
+        raise HTTPException(429, "too many failed logins, try again later")
     user = str(body.get("user") or "").strip()
     password = str(body.get("password") or "")
     ok = bool(PANEL_PASSWORD) and same_text(user, PANEL_USER) and same_text(password, PANEL_PASSWORD)
     if not ok:
+        login_failed(where)
         time.sleep(LOGIN_DELAY)
         raise HTTPException(401, "wrong user or password")
+    with LOGIN_LOCK:
+        LOGIN_FAILURES.pop(where, None)
     response = JSONResponse({"ok": True, "user": user})
     response.set_cookie(
         SESSION_COOKIE,
@@ -851,10 +1455,11 @@ def session_info(request: Request):
 def status(_: str = Depends(require_auth)):
     gpu = gpu_status()
     out = {"gpu": gpu, "gpus": gpu.pop("gpus"), "auto": auto_snapshot()}
+    probe = gpu.pop("probe", None)
     # A page load is also an observation: the set is compared here, not only on
     # the 20-second tick, so a card that just came back shows up at once.
     track_gpus(out["gpus"])
-    out["inventory"] = inventory_view(out["gpus"])
+    out["inventory"] = inventory_view(out["gpus"], probe)
     # What this deployment has: the dashboard says "not configured" instead of
     # showing a consumer's controls as broken.
     out["configured"] = {
@@ -864,96 +1469,125 @@ def status(_: str = Depends(require_auth)):
         "comfyui_api": COMFY_API,
         "llama_logs": bool(AI_HOST),
     }
-    for key, fn in (
-        ("immich_ml", immich_ml_state),
-        ("immich_ffmpeg", immich_transcode),
-        ("jellyfin_accel", jellyfin_accel),
-    ):
-        try:
-            out[key] = fn()
-        except Exception as exc:  # noqa: BLE001 - surface each probe failure
-            out[key] = {"error": str(exc)}
-    try:
-        models = llama_models()
-        out["llama"] = listed_models(models)
+    for key, value in gather_probes({
+        "immich_ml": immich_ml_state,
+        "immich_ffmpeg": immich_transcode,
+        "jellyfin_accel": jellyfin_accel,
+        "llama": llama_models,
+        "comfyui": comfy_stats,
+    }).items():
+        # Each answer is kept, including the ones that are exceptions: a probe
+        # that failed is a reading too, and it is not worth a 500.
+        if isinstance(value, Exception):
+            out[key] = {"error": str(value)}
+        else:
+            out[key] = value
+
+    models = out.get("llama")
+    if isinstance(models, dict):
+        out["llama_counts"] = {"error": models.get("error")}
+    else:
         # Counts cover every model, not only the listed ones.
+        out["llama"] = listed_models(models)
         out["llama_counts"] = {
             "total": len(models),
-            "loaded": sum(1 for m in models if m["status"] == "loaded"),
+            "loaded": sum(1 for model in models if model["status"] == "loaded"),
         }
-    except Exception as exc:  # noqa: BLE001 - surface the probe failure
-        out["llama"] = {"error": str(exc)}
-        out["llama_counts"] = {"error": str(exc)}
-    try:
-        out["comfyui"] = comfy_stats()
-        out["comfyui"]["url"] = COMFY_UI_URL
-    except Exception as exc:  # noqa: BLE001 - surface the probe failure
-        out["comfyui"] = {"state": "unknown", "error": str(exc)}
+    comfyui = out.get("comfyui")
+    if not isinstance(comfyui, dict):
+        out["comfyui"] = {"state": "unknown", "error": "unexpected answer"}
+    elif "error" in comfyui and "state" not in comfyui:
+        out["comfyui"] = {"state": "unknown", **comfyui}
+    out["comfyui"]["url"] = COMFY_UI_URL
     return out
+
+
+def attempt(result, key, action, done, label=None):
+    """Run one consumer action, keep its answer, and never claim a skip.
+
+    The mode endpoints used to raise halfway through: ComfyUI stopped, the
+    router down, and `last_action` still saying nothing happened. Each action
+    now answers for itself and the message says only what ran.
+    """
+    try:
+        result[key] = action()
+    except Exception as exc:  # noqa: BLE001 - one consumer failing is not the mode
+        result[key] = {"error": str(exc)}
+        return False
+    if label:
+        done.append(label)
+    return True
+
+
+def unload_models(result, done):
+    """Unload llama.cpp, and only say so when something was actually unloaded."""
+    try:
+        unloaded = llama_unload_all()
+    except Exception as exc:  # noqa: BLE001 - a router that is down is an answer
+        result["llama"] = {"error": str(exc)}
+        return False
+    result["llama"] = unloaded
+    if unloaded:
+        done.append("llama.cpp unloaded")
+        return True
+    return False
 
 
 @app.post("/api/mode/{mode}")
 def set_mode(mode: str, _: str = Depends(require_auth)):
     global llm_blocked
+    # Validated before anything is stopped: an unknown mode used to stop ComfyUI
+    # and then answer 400.
+    if mode not in ("llm", "media", "balanced", "image"):
+        raise HTTPException(400, "mode must be llm, media, balanced or image")
     result = {}
     done = []
     # ComfyUI would keep holding the card: stop it before leaving Image mode.
-    if mode in ("llm", "media", "balanced") and COMFY:
-        with contextlib.suppress(Exception):
-            if comfy_state() == "running":
-                result["comfyui"] = comfy("stop")
-                done.append("ComfyUI stopped")
+    if mode in ("llm", "media", "balanced") and COMFY and comfy_state() == "running":
+        attempt(result, "comfyui", lambda: comfy("stop"), done, "ComfyUI stopped")
 
     if mode == "llm":
         if IMMICH:
-            result["immich_ml"] = immich_ml("stop")
-            done.append("Immich ML stopped")
+            attempt(result, "immich_ml", lambda: immich_ml("stop"), done, "Immich ML stopped")
         if JELLYFIN:
-            result["jellyfin"] = jellyfin_release_gpu()
-            done.append(f"Jellyfin on {JELLYFIN_DEVICES[JELLYFIN_FALLBACK]}")
+            attempt(result, "jellyfin", jellyfin_release_gpu, done,
+                    f"Jellyfin on {JELLYFIN_DEVICES[JELLYFIN_FALLBACK]}")
         llm_blocked = True
         record_action(f"mode LLM: {', '.join(done) or 'nothing to move'} (card free for llama.cpp)")
     elif mode == "media":
-        result["llama"] = llama_unload_all()
-        done.append("llama.cpp unloaded")
+        unload_models(result, done)
         if IMMICH:
-            result["immich_ml"] = immich_ml("start")
-            done.append("Immich ML on")
+            attempt(result, "immich_ml", lambda: immich_ml("start"), done, "Immich ML on")
         if JELLYFIN:
-            result["jellyfin"] = jellyfin_ensure_accel("nvenc")
-            done.append(f"Jellyfin on {JELLYFIN_DEVICES['nvenc']}")
+            attempt(result, "jellyfin", lambda: jellyfin_ensure_accel("nvenc"), done,
+                    f"Jellyfin on {JELLYFIN_DEVICES['nvenc']}")
         state["jellyfin_before_llm"] = None
         llm_blocked = False
-        record_action(f"mode Media: {', '.join(done)}")
+        record_action(f"mode Media: {', '.join(done) or 'nothing to move'}")
     elif mode == "balanced":
         if IMMICH:
-            result["immich_ml"] = immich_ml("start")
-            done.append("Immich ML on")
+            attempt(result, "immich_ml", lambda: immich_ml("start"), done, "Immich ML on")
         if JELLYFIN:
-            result["jellyfin"] = jellyfin_ensure_accel("nvenc")
-            done.append(f"Jellyfin on {JELLYFIN_DEVICES['nvenc']}")
+            attempt(result, "jellyfin", lambda: jellyfin_ensure_accel("nvenc"), done,
+                    f"Jellyfin on {JELLYFIN_DEVICES['nvenc']}")
         state["jellyfin_before_llm"] = None
         llm_blocked = False
         record_action(f"mode Shared: {', '.join(done) or 'nothing to move'} (llama.cpp not unloaded)")
-    elif mode == "image":
+    else:
         # Image generation needs the whole card: unload llama.cpp, stop the CUDA
         # Immich workload and move Jellyfin off (it keeps transcoding).
-        result["llama"] = llama_unload_all()
-        done.append("llama.cpp unloaded")
+        unload_models(result, done)
         if IMMICH:
-            result["immich_ml"] = immich_ml("stop")
-            done.append("Immich ML stopped")
+            attempt(result, "immich_ml", lambda: immich_ml("stop"), done, "Immich ML stopped")
         if JELLYFIN:
-            result["jellyfin"] = jellyfin_release_gpu()
-            done.append(f"Jellyfin on {JELLYFIN_DEVICES[JELLYFIN_FALLBACK]}")
+            attempt(result, "jellyfin", jellyfin_release_gpu, done,
+                    f"Jellyfin on {JELLYFIN_DEVICES[JELLYFIN_FALLBACK]}")
         state["jellyfin_before_llm"] = None
         if COMFY:
-            result["comfyui"] = comfy("start")
-            done.append("ComfyUI started with the card to itself")
+            attempt(result, "comfyui", lambda: comfy("start"), done,
+                    "ComfyUI started with the card to itself")
         llm_blocked = False
-        record_action(f"mode Image: {', '.join(done)}")
-    else:
-        raise HTTPException(400, "mode must be llm, media, balanced or image")
+        record_action(f"mode Image: {', '.join(done) or 'nothing to move'}")
     return result
 
 
@@ -982,27 +1616,38 @@ def set_power(body: dict = Body(...), _: str = Depends(require_auth)):
     # itself, because `nvidia-smi -pl` without `-i` fails as a whole as soon as
     # one of them does not accept the value.
     cards = gpu_status()["gpus"]
-    ranges = [(g["index"], as_number(g["power_min"], None), as_number(g["power_max"], None)) for g in cards]
+    commands = [(card, power_command(card, watts)) for card in cards]
+    settable = [(card, command) for card, command in commands if command]
+    skipped = [(card, command) for card, command in commands if not command]
+    ranges = [(card.get("index"), as_number(card.get("power_min"), None), as_number(card.get("power_max"), None))
+              for card, _ in settable]
     known = [(index, low, high) for index, low, high in ranges if low is not None and high is not None]
     if known:
         low, high = min(low for _, low, _ in known), max(high for _, _, high in known)
         if not low <= watts <= high:
             raise HTTPException(400, f"watts must be between {int(low)} and {int(high)}")
+    if not settable:
+        raise HTTPException(400, "no card on this host exposes a settable power limit")
 
     results = []
-    for index, _, _ in ranges:
-        p = ssh(GPU_HOST, f"nvidia-smi -i {index} -pl {watts}")
-        entry = {"index": index, "ok": p.returncode == 0}
+    for card, command in settable:
+        p = ssh(GPU_HOST, command)
+        entry = {"index": card.get("index"), "ok": p.returncode == 0}
         if p.returncode != 0:
-            entry["error"] = (p.stderr or p.stdout).strip()[:200] or "nvidia-smi refused the limit"
+            entry["error"] = (p.stderr or p.stdout).strip()[:200] or "the driver refused the limit"
         results.append(entry)
-    if not any(entry["ok"] for entry in results):
-        raise HTTPException(502, results[0]["error"])
+    for card, _ in skipped:
+        # Not a refusal: a vendor with no power cap is a different answer than
+        # a card that was asked and said no.
+        results.append({"index": card.get("index"), "vendor": card.get("vendor"),
+                        "skipped": "this vendor exposes no power limit"})
+    if not any(entry.get("ok") for entry in results):
+        raise HTTPException(502, results[0].get("error") or "no card accepted the limit")
 
-    refused = [entry["index"] for entry in results if not entry["ok"]]
+    refused = [entry["index"] for entry in results if entry.get("ok") is False]
     record_action(
         f"power limit = {watts} W"
-        + (f" ({len(refused)} card(s) refused: {', '.join(refused)})" if refused else "")
+        + (f" ({len(refused)} card(s) refused: {', '.join(str(i) for i in refused)})" if refused else "")
     )
     return {"ok": not refused, "watts": watts, "cards": results}
 

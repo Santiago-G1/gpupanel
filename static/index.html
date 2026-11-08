@@ -179,6 +179,14 @@ const str = (v) => (typeof v === 'string' ? v : '');
 const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : null; };
 const gib = (mib) => (mib / 1024).toFixed(1);
 const deviceLabel = (a) => DEVICES[a] || a || '—';
+// The vendors the probe understands. Anything else is printed as it came.
+const VENDORS = {nvidia: 'NVIDIA', amd: 'AMD', intel: 'Intel'};
+// Card names and kernel lines are text, not markup.
+const esc = (v) => String(v === null || v === undefined ? '' : v)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+// A reading the card does not have is a dash, never `N/A °C`.
+const reading = (v, unit) => (v === null || v === undefined || v === 'N/A' || v === '')
+  ? '—' : `${v}${unit ? ' ' + unit : ''}`;
 
 /* ---------------------------------------------------------------- feedback */
 function toast(text, kind, sticky) {
@@ -331,17 +339,24 @@ function paintState(s) {
   syncPower();
 }
 
+// The cards that report a range, which is not every card and not every vendor:
+// an Intel iGPU has no power cap and an AMD one needs the ROCm tool.
+function settableCards() {
+  const gpus = Array.isArray(last && last.gpus) ? last.gpus : [];
+  return gpus.filter((x) => num(x.power_min) !== null && num(x.power_max) !== null
+    && x.power_settable !== false);
+}
+
 function syncPower() {
   const btn = $('pl-apply');
   const watts = Number($('pl').value);
-  const card = (last && last.gpu) || {};
-  const range = num(card.power_min) !== null && num(card.power_max) !== null;
-  const limits = Array.isArray(card.power_limits) ? card.power_limits.map(Number) : [];
-  const same = limits.length > 0 && limits.every((l) => l === watts);
-  if (!range) {
+  const cards = settableCards();
+  const limits = cards.map((x) => Number(x.power_limit));
+  const same = cards.length > 0 && limits.every((l) => l === watts);
+  if (!cards.length) {
     // Some cards (and every vGPU) do not expose a settable range.
     btn.textContent = 'Power limit not settable';
-    btn.title = 'nvidia-smi does not report a supported range for this card';
+    btn.title = 'No card on this host reports a supported range';
     btn.disabled = true;
     return;
   }
@@ -351,34 +366,84 @@ function syncPower() {
   btn.title = same ? 'The current limit is already ' + watts + ' W' : '';
 }
 
-// The card set is the one thing nvidia-smi is silent about: a card that does
-// not initialise is a card fewer, not an error. This is where that shows.
+// The card set is the one thing the driver is silent about: a card that does not
+// initialise is a card fewer, not an error. This is where that shows, with the
+// identity of the card that went and how long it has been away.
+function ago(sec) {
+  if (sec === null || sec === undefined) return 'never seen';
+  if (sec < 90) return Math.max(1, Math.round(sec)) + ' s';
+  if (sec < 5400) return Math.round(sec / 60) + ' min';
+  if (sec < 172800) return (sec / 3600).toFixed(1) + ' h';
+  return Math.round(sec / 86400) + ' d';
+}
+
+// What a card is called in a sentence: the name, the bus address if there is
+// one, and the short serial when the vendor gives a UUID.
+function whereCard(g) {
+  const parts = [`<b style="color:var(--fg)">${esc(g.name || 'GPU')}</b>`];
+  if (g.pci) parts.push(`<span class="mono">${esc(g.pci)}</span>`);
+  else if (g.uuid && String(g.uuid).length > 8) parts.push(`<span class="mono">${esc(String(g.uuid).slice(4, 12))}</span>`);
+  return parts.join(' ');
+}
+
+// The kernel said something at the moment the card changed: that is the only
+// difference between a card that died and a card the driver dropped.
+function evidence(event) {
+  const lines = (event && event.evidence) || [];
+  if (!lines.length) return '';
+  return `<div class="k" style="margin-top:8px">Kernel around the change:
+    <span class="mono" style="display:block;white-space:pre-wrap;margin-top:4px">${esc(lines.slice(-4).join('\n'))}</span></div>`;
+}
+
 function renderInventory(inv) {
   const box = $('gpu-alert');
-  const lc = inv.last_change || null;
+  const health = inv.state || 'ok';
   const count = inv.count || 0;
   const expected = inv.expected || 0;
-  const missing = inv.missing || 0;
-  const label = (g) => `${g.name} <span class="mono">${String(g.uuid || '').slice(4, 12)}</span>`;
+  const absent = inv.absent || [];
+  const flapping = inv.flapping || [];
+  const events = inv.events || [];
+  const errors = ((inv.probe || {}).errors || []).filter(Boolean);
+  const change = events.length ? events[events.length - 1] : (inv.last_change || null);
   let html = '';
-  if (missing > 0) {
+
+  if (health === 'empty') {
+    html = `<span class="pill off">0${expected ? ' of ' + expected : ''}</span>
+      <b style="color:var(--fg)">no card answers</b>
+      <div class="k" style="margin-top:8px">The card host is reachable and reports no card at all:
+        ${expected ? `all ${expected} are gone and the driver has nothing to list.` : 'the driver is unloaded or its cards are gone.'}
+        ${absent.length ? '<br>Missing: ' + absent.map((g) => `${whereCard(g)} <span class="mono">${ago(g.seconds)}</span>`).join(', ') : ''}
+        ${change && change.at ? `<br>Last change ${esc(change.at)}.` : ''}</div>${evidence(change)}`;
+  } else if (absent.length) {
+    html = `<span class="pill off">${count} of ${expected || count + absent.length}</span>
+      <b style="color:var(--fg)">${absent.length} card${absent.length > 1 ? 's' : ''} missing</b>
+      <div class="k" style="margin-top:8px">${absent.map((g) =>
+        `${whereCard(g)} <span class="mono">${ago(g.seconds)}</span>${g.wanted ? ' · expected' : ''}`).join('<br>')}</div>
+      ${change && change.at ? `<div class="k">Last change ${esc(change.at)}</div>` : ''}${evidence(change)}`;
+  } else if (flapping.length) {
+    html = `<span class="pill off">${count}</span>
+      <b style="color:var(--fg)">a card keeps going and coming back</b>
+      <div class="k" style="margin-top:8px">${flapping.map((g) =>
+        `${whereCard(g)} <span class="mono">${g.lost}×</span>`).join(', ')} in the last hour: a link or a power
+        problem, not a card that is simply missing.</div>${evidence(change)}`;
+  } else if (health === 'partial') {
     html = `<span class="pill off">${count} of ${expected}</span>
-      <b style="color:var(--fg)">${missing} card${missing > 1 ? 's' : ''} missing</b>
-      <div class="k" style="margin-top:8px">
-        nvidia-smi answers with ${count} card${count === 1 ? '' : 's'}, so one is not
-        initialising: the panel cannot fix that. Check the card after the last
-        kernel update and reload the driver.
-      </div>`;
-  } else if (lc && (lc.added || []).length) {
-    html = `<span class="pill ok">new card</span>
-      <b style="color:var(--fg)">${lc.added.map(label).join(', ')}</b>
-      <span class="k">came up ${lc.at}${expected ? ` — ${count} of ${expected} now` : ''}</span>`;
+      <b style="color:var(--fg)">${Math.max(expected - count, 0)} card${expected - count === 1 ? '' : 's'} missing</b>
+      <div class="k" style="margin-top:8px">The driver answers with ${count}, so one is not initialising:
+        the panel cannot fix that.</div>`;
+  } else if (change && change.kind === 'added') {
+    html = `<span class="pill ok">new card</span> ${whereCard(change)}
+      <span class="k">came up ${esc(change.at)}${expected ? ` — ${count} of ${expected} now` : ''}</span>${evidence(change)}`;
   } else if (expected) {
     html = `<span class="pill ok">${count} of ${expected}</span>
-      <span class="k">cards answering${lc ? ` · last change ${lc.at}` : ''}</span>`;
-  } else if (lc) {
-    html = `<span class="pill acc">${count}</span>
-      <span class="k">cards · last change ${lc.at}</span>`;
+      <span class="k">cards answering${change && change.at ? ` · last change ${esc(change.at)}` : ''}</span>`;
+  } else if (count) {
+    html = `<span class="pill ok">${count}</span>
+      <span class="k">card${count === 1 ? '' : 's'} answering${change && change.at ? ` · last change ${esc(change.at)}` : ''}</span>`;
+  }
+  if (errors.length) {
+    html += `<div class="k" style="margin-top:8px">The card host said:
+      <span class="mono">${esc(errors[0])}</span></div>`;
   }
   box.style.display = html ? '' : 'none';
   box.innerHTML = html;
@@ -387,40 +452,63 @@ function renderInventory(inv) {
 async function refresh() {
   let s;
   try { s = await api('/api/status'); }
-  catch (e) { if (!String(e.message).includes('session')) $('gpu-name').textContent = 'no connection'; return; }
+  catch (e) {
+    if (String(e.message).includes('session')) return;
+    // A card host that does not answer is not a card set of zero: it is a host
+    // problem, and the panel says which one.
+    $('gpu-name').textContent = 'card host unreachable';
+    renderInventory({state: 'unreachable', count: 0, desired: 0,
+      probe: {errors: [String(e.message || e)]}});
+    return;
+  }
   last = s;
   const g = s.gpu || {};
-  const gpus = Array.isArray(s.gpus) && s.gpus.length ? s.gpus : [g];
+  const gpus = Array.isArray(s.gpus) ? s.gpus : (g.name ? [g] : []);
   renderInventory(s.inventory || {});
-  $('gpu-name').textContent = gpus.length > 1
-    ? `${gpus.length} × ${g.name} · driver ${g.driver}`
+  $('gpu-name').textContent = !gpus.length ? 'no cards'
+    : gpus.length > 1 ? `${gpus.length} × ${g.name} · driver ${g.driver}`
     : `${g.name} · driver ${g.driver}`;
-  $('gpu-cards').innerHTML = gpus.map((x) => {
+  $('gpu-cards').innerHTML = gpus.length ? gpus.map((x) => {
     const used = num(x.mem_used), total = num(x.mem_total);
     const util = num(x.util);
     const usedPct = used !== null && total ? Math.round(100 * used / total) : undefined;
     const link = x.pcie_gen && x.pcie_gen !== 'N/A'
       ? `PCIe Gen${x.pcie_gen} ×${x.pcie_width}` : '';
+    const vendor = VENDORS[x.vendor] || x.vendor || '';
+    // A card on the bus that the driver does not list is a card the driver lost,
+    // which is a different problem from a card that is not in the machine.
+    const blind = x.driver_visible === false;
+    const offBus = x.bus_visible === false;
     return `<div style="margin-bottom:14px">
       <div class="k" style="margin:0 0 6px">
-        <b style="color:var(--fg)">GPU ${x.index}</b>
-        <span class="mono"> · ${link}${link ? ' · ' : ''}${x.mem_total} MiB</span>
+        <b style="color:var(--fg)">GPU ${esc(x.index ?? '—')}</b>
+        ${vendor ? `<span class="pill">${esc(vendor)}</span>` : ''}
+        ${blind ? '<span class="pill off">driver does not see it</span>' : ''}
+        ${offBus ? '<span class="pill off">not on the bus</span>' : ''}
+        <span class="mono"> · ${esc(x.pci || '')}${x.pci ? ' · ' : ''}${link}${link ? ' · ' : ''}${reading(x.mem_total, 'MiB')}</span>
         <span class="pill ${Number(x.util) > 0 ? 'ok' : 'off'}">${Number(x.util) > 0 ? 'busy' : 'idle'}</span>
       </div>
       <div class="grid">${
-        card('Utilization', util !== null ? util + ' %' : 'N/A', util ?? undefined) +
-        card('VRAM', used !== null && total !== null ? `${gib(used)} / ${gib(total)} GiB` : 'N/A', usedPct) +
-        card('Temperature', x.temp + ' °C') +
-        card('Power', `${x.power_draw} / ${x.power_limit} W`) +
-        card('SM / Mem clock', `${x.clk_sm} / ${x.clk_mem} MHz`)
+        card('Utilization', util !== null ? util + ' %' : '—', util ?? undefined) +
+        card('VRAM', used !== null && total !== null ? `${gib(used)} / ${gib(total)} GiB` : '—', usedPct) +
+        card('Temperature', reading(x.temp, '°C')) +
+        card('Power', `${reading(x.power_draw, 'W')} / ${reading(x.power_limit, 'W')}`) +
+        card('SM / Mem clock', `${reading(x.clk_sm, 'MHz')} / ${reading(x.clk_mem, 'MHz')}`)
       }</div>
     </div>`;
-  }).join('');
-  $('pl-now').textContent = gpus.map((x) => x.power_limit).join(' / ') + ' W';
-  const plMin = num(g.power_min), plMax = num(g.power_max);
+  }).join('') : '<div class="k">The card host answers and lists no card at all.</div>';
+  $('pl-now').textContent = gpus.length ? gpus.map((x) => reading(x.power_limit, 'W')).join(' / ') : '—';
+  // The range is every card's, not the first one's: a mixed machine has cards
+  // that report nothing.
+  const ranges = gpus
+    .map((x) => [num(x.power_min), num(x.power_max)])
+    .filter(([low, high]) => low !== null && high !== null);
+  const plMin = ranges.length ? Math.min(...ranges.map((r) => r[0])) : null;
+  const plMax = ranges.length ? Math.max(...ranges.map((r) => r[1])) : null;
   $('pl-range').textContent = plMin !== null && plMax !== null
-    ? `${plMin}–${plMax} W` : 'not reported by the card';
+    ? `${plMin}–${plMax} W` : 'not reported by any card';
   const pl = $('pl');
+  pl.disabled = plMin === null || plMax === null;
   if (plMin !== null && plMax !== null) {
     pl.min = plMin; pl.max = plMax;
     // A default of 150 W is outside the range of some cards.
@@ -503,7 +591,7 @@ $('pl-apply').onclick = async () => {
   const refused = (r && Array.isArray(r.cards) ? r.cards : []).filter((c) => !c.ok);
   if (refused.length) {
     msg(refused.length + ' card(s) refused ' + watts + ' W: ' + refused.map((c) => 'GPU ' + c.index).join(', ')
-        + ' — ' + (refused[0].error || 'nvidia-smi said no'), true);
+        + ' — ' + (refused[0].error || 'the driver said no'), true);
   }
 };
 

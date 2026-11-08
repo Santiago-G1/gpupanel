@@ -342,15 +342,25 @@ def test_inventory_tracks_the_card_set(panel, tmp_path):
     assert panel.state["gpus_last_change"] is None  # order is not a change
 
     panel.track_gpus([a])
-    assert panel.state["gpus_last_change"]["removed"] == [{"uuid": b["uuid"], "name": "Card B"}]
+    change = panel.state["gpus_last_change"]
+    assert [(card["uuid"], card["name"], card["key"]) for card in change["removed"]] == [
+        (b["uuid"], "Card B", b["uuid"])
+    ]
     assert "1 GPU lost: Card B (bbbb)" in panel.state["last_action"]
+    # The card is remembered as missing, with the moment it went.
+    assert panel.state["gpus_down"][b["uuid"]]["since"]
+    assert panel.inventory_view([a])["state"] == "partial"
 
     panel.track_gpus([a, b])
-    assert panel.state["gpus_last_change"]["added"] == [{"uuid": b["uuid"], "name": "Card B"}]
+    assert [(card["uuid"], card["name"]) for card in panel.state["gpus_last_change"]["added"]] == [
+        (b["uuid"], "Card B")
+    ]
     assert "1 new GPU: Card B (bbbb)" in panel.state["last_action"]
+    assert panel.state["gpus_down"] == {}
 
     view = panel.inventory_view([a, b])
     assert (view["count"], view["expected"], view["missing"]) == (2, 0, 0)
+    assert view["state"] == "ok"
     assert json.loads((tmp_path / "auto.json").read_text())["gpus_known"] == [a["uuid"], b["uuid"]]
 
 
@@ -474,3 +484,271 @@ def test_llama_logs_are_capped(panel):
     assert "-n 2000" in seen["command"]
     with pytest.raises(panel.HTTPException):
         panel.llama_logs("many")
+
+
+# --- the probe: two views of the same machine -------------------------------
+PROBE_TOOLS = {"nvidia-smi": True}
+
+
+def probe(sysfs=(), nvinfo=(), gpu_lines=(), proc_lines=(), tools=None, gpu_rc="0"):
+    """What the probe script prints, section by section."""
+    tools = PROBE_TOOLS if tools is None else tools
+    lines = ["@@tools", "tool" + "".join(f"\t{name}={int(ok)}" for name, ok in tools.items())]
+    lines.append("@@sysfs")
+    lines += ["card" + "".join(f"\t{key}={value}" for key, value in card.items()) for card in sysfs]
+    lines.append("@@nvinfo")
+    lines += ["nv" + "".join(f"\t{key}={value}" for key, value in info.items()) for info in nvinfo]
+    lines.append("@@gpu")
+    lines += list(gpu_lines)
+    lines += ["@@gpu_rc", gpu_rc, "@@procs"]
+    lines += list(proc_lines)
+    lines += ["@@procs_rc", "0", "@@end"]
+    return "\n".join(lines)
+
+
+def stub_probe(panel, **kwargs):
+    panel.ssh_script = lambda host, script, timeout=60: Proc(probe(**kwargs))
+
+
+def nvidia_row(index="0", uuid="GPU-1111-2222", name="Tesla P100", **overrides):
+    values = {
+        "index": index, "uuid": uuid, "name": name, "driver": "580.1",
+        "mem_used": "100", "mem_total": "16384", "util": "0", "temp": "40",
+        "power_draw": "30", "power_limit": "175.00", "power_default": "250",
+        "power_min": "100", "power_max": "250", "clk_sm": "1328", "clk_mem": "715",
+        "pcie_gen": "3", "pcie_width": "16",
+    }
+    values.update(overrides)
+    return ",".join(values[key] for key in values)
+
+
+def test_the_probe_script_formats_nothing_it_does_not_mean(panel):
+    # `%` in the script would collide with the CSV substitution, so the fields
+    # are a token and not a format string.
+    assert "@@end" in panel.PROBE_SCRIPT
+    assert "@FIELDS@" in panel.PROBE_SCRIPT
+    assert "%s" not in panel.PROBE_SCRIPT.split("@@tools")[1].split("@@end")[0].replace("printf '%s\\n'", "")
+
+
+def test_a_card_the_driver_lost_is_not_a_refused_probe(panel):
+    # On the bus, missing from nvidia-smi: the driver gave up on it. That is an
+    # event with an identity, not a 502 with a nvidia-smi error in it.
+    stub_probe(
+        panel,
+        sysfs=[{"bdf": "0000:01:00.0", "drm": "card0", "vendor": "0x10de", "driver": "nvidia",
+                "name": "Tesla P100 PCIe 16GB"}],
+        nvinfo=[{"uuid": "GPU-1111-2222", "bdf": "0000:01:00.0"}],
+        gpu_lines=[],
+    )
+    gpu = panel.gpu_status()
+
+    card = gpu["gpus"][0]
+    assert (card["bus_visible"], card["driver_visible"]) == (True, False)
+    assert panel.card_key(card) == "GPU-1111-2222"  # the bus entry keeps its UUID
+    assert gpu["util_max"] == 0
+
+
+def test_a_machine_whose_cards_all_went_is_an_event_not_a_502(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, GPU_EXPECTED="2")
+    board = [
+        {"uuid": "GPU-aaaa-1111", "name": "Card A", "pci": "0000:01:00.0", "index": "0"},
+        {"uuid": "GPU-bbbb-2222", "name": "Card B", "pci": "0000:02:00.0", "index": "1"},
+    ]
+    panel.track_gpus(board)  # baseline
+    stub_probe(panel)  # the host answers, with no card at all
+
+    status = panel.status("t")
+
+    assert status["gpus"] == []
+    assert status["gpu"]["name"] == "no cards"
+    assert (status["inventory"]["count"], status["inventory"]["state"]) == (0, "empty")
+    assert {card["key"] for card in status["inventory"]["absent"]} == {"GPU-aaaa-1111", "GPU-bbbb-2222"}
+    assert panel.state["gpus_last_change"]["removed"]
+    absent = status["inventory"]["absent"]
+    assert all(card["seconds"] >= 0 for card in absent)
+    assert all(card["name"] for card in absent)
+
+
+def test_an_amd_card_is_read_from_sysfs(panel):
+    stub_probe(
+        panel,
+        tools={"amd-smi": True},
+        sysfs=[{
+            "bdf": "0000:03:00.0", "drm": "card0", "vendor": "0x1002", "driver": "amdgpu",
+            "name": "Radeon RX 7900 XTX", "vram_used": str(2048 * 2**20), "vram_total": str(24576 * 2**20),
+            "busy": "42", "temp": "55000", "power": "120000000", "cap": "250000000",
+            "cap_min": "150000000", "cap_max": "300000000", "clk": "2500000000",
+            "clk_mem": "1000000000", "link_speed": "16.0 GT/s PCIe", "link_width": "16",
+            "aer_fatal": "0", "aer_nonfatal": "1", "aer_correctable": "0",
+        }],
+    )
+    card = panel.gpu_status()["gpus"][0]
+
+    assert (card["vendor"], card["driver"], card["name"]) == ("amd", "amdgpu", "Radeon RX 7900 XTX")
+    assert (card["mem_used"], card["mem_total"], card["util"], card["temp"]) == ("2048", "24576", "42", "55")
+    assert (card["power_draw"], card["power_limit"]) == ("120", "250.00")
+    assert (card["clk_sm"], card["clk_mem"]) == ("2500", "1000")
+    assert (card["pcie_gen"], card["pcie_width"]) == ("4", "16")
+    assert card["aer"]["nonfatal"] == "1"
+    assert (card["setter"], card["power_settable"]) == ("amd-smi", True)
+    assert panel.card_key(card) == "0000:03:00.0"
+
+
+def test_the_amd_power_limit_goes_through_amd_smi(panel):
+    card = dict(CARD, vendor="amd", pci="0000:03:00.0", setter="amd-smi", power_min="150", power_max="300")
+    card.update({"util_max": 0, "power_limits": ["250.00"], "gpus": [card]})
+    panel.gpu_status = lambda: dict(card, gpus=[dict(card)])
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+
+    assert panel.set_power({"watts": 250}, "t")["ok"] is True
+    assert calls == ["amd-smi set -g 0 --power-cap 250"]
+
+
+def test_an_intel_card_has_no_power_control(panel):
+    stub_probe(
+        panel,
+        sysfs=[{"bdf": "0000:00:02.0", "drm": "card0", "vendor": "0x8086", "driver": "i915",
+                "name": "Xeon E3-1200 v2 Graphics", "link_width": "1"}],
+    )
+    card = panel.gpu_status()["gpus"][0]
+
+    assert (card["vendor"], card["driver"], card["power_settable"]) == ("intel", "i915", False)
+    assert card["mem_total"] == "N/A"
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.set_power({"watts": 100}, "t")
+    assert exc.value.status_code == 400
+    assert "no card" in exc.value.detail
+
+
+def test_a_card_that_went_blind_is_its_own_event(panel):
+    board = [{"uuid": "GPU-1111-2222", "name": "Tesla P100", "pci": "0000:01:00.0",
+              "index": "0", "driver_visible": True}]
+    panel.track_gpus(board)
+    panel.track_gpus([{**board[0], "driver_visible": False}])
+
+    kinds = [event["kind"] for event in panel.state["gpus_events"]]
+    assert kinds == ["blind"]
+    assert "not in the driver" in panel.state["last_action"]
+    assert panel.state["gpus_down"] == {}  # it is still there
+
+    panel.track_gpus(board)
+    assert [event["kind"] for event in panel.state["gpus_events"]] == ["blind", "visible"]
+
+
+def test_a_change_carries_the_kernel_lines_that_explain_it(panel):
+    board = [{"uuid": "GPU-1111-2222", "name": "Tesla P100", "pci": "0000:01:00.0", "index": "0"}]
+    panel.track_gpus(board)
+    panel.ssh = lambda host, command, timeout=30: Proc("NVRM: Xid 79, GPU has fallen off the bus\n")
+
+    panel.track_gpus([])
+
+    event = panel.state["gpus_events"][-1]
+    assert event["kind"] == "removed"
+    assert event["evidence"] == ["NVRM: Xid 79, GPU has fallen off the bus"]
+
+
+def test_a_dropped_card_that_keeps_crossing_the_bus_is_named_once(panel):
+    board = [{"uuid": "GPU-1111-2222", "name": "Tesla P100", "pci": "0000:01:00.0", "index": "0"}]
+    panel.track_gpus(board)
+    panel.ssh = lambda host, command, timeout=30: Proc()
+
+    for _ in range(3):
+        panel.track_gpus([])
+        panel.track_gpus(board)
+
+    # It is back, so nothing is missing; the flapping is what the history says.
+    view = panel.inventory_view(board)
+    assert view["absent"] == []
+    assert view["flapping"] == [{"key": "GPU-1111-2222", "name": "Tesla P100", "lost": 3}]
+    # The history is bounded, however often a card flaps.
+    assert len(panel.state["gpus_events"]) <= panel.GPU_EVENTS_MAX
+
+
+def test_expected_ids_name_the_cards_that_should_be_there(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, GPU_EXPECTED_IDS="0000:01:00.0,0000:02:00.0")
+    board = [{"uuid": "0000:01:00.0", "name": "Card A", "pci": "0000:01:00.0", "index": "0", "vendor": "amd"}]
+    gone = {"uuid": "0000:02:00.0", "name": "Card B", "pci": "0000:02:00.0", "index": "1", "vendor": "amd"}
+    panel.track_gpus(board + [gone])  # baseline
+    panel.track_gpus(board)  # the second card went
+    view = panel.inventory_view(board)
+
+    assert [card["key"] for card in view["absent"]] == ["0000:02:00.0"]
+    assert view["absent"][0]["wanted"] is True
+    assert view["missing"] == 1
+
+
+# --- actions that used to be claimed ----------------------------------------
+def test_a_router_that_is_down_is_not_a_claimed_unload(panel):
+    def boom():
+        raise RuntimeError("router down")
+
+    panel.llama_unload_all = boom
+
+    out = panel.set_mode("media", "t")
+
+    assert "error" in out["llama"]
+    assert "unloaded" not in panel.state["last_action"]
+
+
+def test_an_unknown_mode_stops_nothing(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, COMFY_CONTAINER="comfyui")
+    calls = []
+    panel.comfy_state = lambda: "running"
+    panel.comfy = lambda action: calls.append(action) or {"ok": True}
+
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.set_mode("nonsense", "t")
+
+    assert (exc.value.status_code, calls) == (400, [])
+
+
+def test_guessing_the_password_stops(panel):
+    for _ in range(5):
+        with pytest.raises(panel.HTTPException) as exc:
+            panel.login(request(), {"user": "admin", "password": "nope"})
+        assert exc.value.status_code == 401
+
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.login(request(), {"user": "admin", "password": "nope"})
+    assert exc.value.status_code == 429
+
+
+def test_a_reading_the_vendor_does_not_report_is_not_a_number(panel):
+    assert panel._tidy("55000", 1000) == "55"
+    assert panel._tidy("") == "N/A"
+    assert panel._pcie_gen("16.0 GT/s PCIe") == "4"
+    assert panel._pcie_gen("N/A") == "N/A"
+
+
+def test_the_drivers_rows_learn_their_pci_address(panel):
+    # /proc/driver/nvidia is what ties a UUID to the bus; without it the bus
+    # entries looked like a second pair of cards.
+    board = [
+        {"bdf": "0000:01:00.0", "drm": "card0", "vendor": "0x10de", "driver": "nvidia",
+         "aer_fatal": "0", "aer_nonfatal": "0", "aer_correctable": "0"},
+        {"bdf": "0000:02:00.0", "drm": "card1", "vendor": "0x10de", "driver": "nvidia"},
+    ]
+    stub_probe(
+        panel,
+        gpu_lines=[nvidia_row(uuid="GPU-1111-2222"), nvidia_row(index="1", uuid="GPU-3333-4444")],
+        sysfs=board,
+        nvinfo=[{"uuid": "GPU-1111-2222", "bdf": "0000:01:00.0"},
+                {"uuid": "GPU-3333-4444", "bdf": "0000:02:00.0"}],
+    )
+    cards = panel.gpu_status()["gpus"]
+
+    assert len(cards) == 2  # no duplicate for the bus view
+    assert [card["pci"] for card in cards] == ["0000:01:00.0", "0000:02:00.0"]
+    assert all(card["driver_visible"] and card["bus_visible"] for card in cards)
+    assert cards[0]["aer"] == {"fatal": "0", "nonfatal": "0", "correctable": "0"}
+    assert cards[1]["aer"] is None
+
+
+def test_a_stray_line_does_not_break_the_records(panel):
+    text = probe(sysfs=[{"bdf": "0000:01:00.0", "vendor": "0x1002", "driver": "amdgpu", "busy": "5"}])
+    text = text.replace("@@nvinfo", "garbage from a multi-line file\n@@nvinfo")
+    panel.ssh_script = lambda *args, **kwargs: Proc(text)
+
+    card = panel.gpu_status()["gpus"][0]
+    assert (card["pci"], card["util"]) == ("0000:01:00.0", "5")

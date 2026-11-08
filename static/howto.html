@@ -47,10 +47,12 @@
   </div>
   <div class="k" style="margin-top:8px">
     A third rule is about the cards themselves: the panel remembers which ones it
-    has seen by UUID. If <b>nvidia-smi answers with fewer cards than expected</b>
-    the dashboard says so at the top, because a card that does not initialise is
-    silent everywhere else — and a card that comes back is recorded with the
-    moment it did.
+    has seen, by UUID or by bus address, and it asks twice — the bus
+    (<span class="mono">/sys/class/drm</span>) and the driver. When a card is
+    <b>missing</b>, or the driver stops listing one that is still there, the
+    dashboard says so at the top with how long it has been gone, and the kernel
+    lines from around the moment it went. A card that comes back is recorded
+    with the moment it did.
   </div>
 </div>
 

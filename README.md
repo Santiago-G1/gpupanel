@@ -2,13 +2,15 @@
 
 One card (or several), a set of things that want it, one owner at a time. This
 is the web panel that arbitrates between them: it watches what the card is
-really doing — `nvidia-smi` over SSH, not a flag of its own — and moves the
-other consumers out of the way when llama.cpp needs the VRAM back.
+really doing — the vendor's own tool over SSH, not a flag of its own — and moves
+the other consumers out of the way when llama.cpp needs the VRAM back. NVIDIA,
+AMD and Intel cards are read, and a card that disappears from the machine is an
+event with a timestamp and the kernel lines that explain it.
 
 ```
 browser ──► reverse proxy ──► https://gpu.<domain> ──► <host>:8099
                                                           │
-                                    SSH ──────────────────┼──► GPU host    nvidia-smi, power limit
+                                    SSH ──────────────────┼──► GPU host    sysfs + nvidia-smi/amd-smi
                                                           ├──► AI host     llama.cpp logs, ComfyUI
                                                           ├──► Immich host ML container, redis, psql
                                                           └──► Jellyfin    encoding.xml
@@ -26,7 +28,7 @@ host and the router: see [Adapting it to your setup](#adapting-it-to-your-setup)
 | What | Why |
 | --- | --- |
 | Docker with Compose v2 | the only runtime dependency; nothing is installed on the hosts |
-| `nvidia-smi` on `GPU_HOST`, over SSH with a key | the cards, their processes and the power limit |
+| SSH with a key to `GPU_HOST` | the cards: `/sys/class/drm` (any vendor) plus `nvidia-smi` for NVIDIA ones. `amd-smi` but no ROCm is needed to *read* an AMD card |
 | A llama.cpp router (`/v1/models`, `/models/unload`) | llama.cpp in router mode or llama-swap; `LLAMA_API_KEY` if it wants a key |
 | SSH to the consumers' hosts | `docker` there for Immich, a file rewrite for Jellyfin, `pct exec` only with `AI_CTID` |
 | journald on `AI_HOST` | only for the log tail endpoint |
@@ -63,20 +65,52 @@ A card that does not initialise is silent everywhere else: no driver error
 reaches the panel, `nvidia-smi` just answers with one card fewer, and everything
 still works on the ones that are there. This is how the second P100 of the
 reference deployment fails after a kernel update, so the panel keeps the set of
-UUIDs it has seen and compares it with every observation (the 20-second tick, plus each
-dashboard load):
+cards it has seen and compares it with every observation (the 20-second tick,
+plus each dashboard load).
+
+The probe reads **two views of the same machine**, in one SSH session:
+
+| View | Where it comes from | What it proves |
+| --- | --- | --- |
+| the bus | `/sys/class/drm/card*/device` | the card is in the machine |
+| the driver | `nvidia-smi`, `amdgpu`/`i915` sysfs | the card is usable |
+
+When they disagree the panel can tell three cases apart, which is the whole
+point of asking twice:
+
+| Situation | What it means |
+| --- | --- |
+| in both | a healthy card |
+| only on the bus | the driver lost it — `Xid 79`, a crashed module: the card is there and `nvidia-smi` does not list it |
+| in neither | it fell off the bus: power, riser, or the slot |
 
 | Situation | What the dashboard shows |
 | --- | --- |
 | `count == GPU_EXPECTED` | a quiet `2 of 2` pill |
-| `count < GPU_EXPECTED` | `1 of 2 · 1 card missing`, with the reason it cannot be fixed from here |
-| a card appears | `new card`, its name, its UUID and when it came up |
+| a card missing | `1 of 2 · 1 card missing`, then its name, address and how long it has been gone |
+| every card gone | `no card answers` — the host replies and the driver lists nothing |
+| a card appears | `new card`, with its name, address and when it came up |
+| it comes and goes | `a card keeps going and coming back`, with how many times in the hour |
+| a card only the bus has | `driver does not see it` on that card |
 | `GPU_EXPECTED=0` | only changes are reported; nothing is called missing |
 
-A change is written to the state file and to the last-action line, so a card
-that vanished overnight has a timestamp in the morning. The comparison is on the
-UUID set, not the count: a card that is swapped for another is a change too, and
-the order `nvidia-smi` reports them in is not.
+Every change is an event: a timestamp, the card, and **the kernel lines from the
+ten minutes around it** (`NVRM`, `Xid`, `AER`, `pcieport`, `amdgpu` resets). That
+is the difference between "a card is gone" and "the card fell off the bus at
+03:12". `GPU_EVIDENCE=0` turns the extra SSH off; the last 50 events stay in the
+state file, so a card that vanished overnight has a record in the morning.
+
+Cards are keyed by UUID when the vendor gives one, and by **PCI address**
+otherwise — the UUID comes from the driver and goes with it, so the same card
+would read as a removal plus an arrival. `GPU_EXPECTED_IDS` names the exact set
+a machine should have, for when a count is not enough.
+
+`/sys/class/drm` is also how the other vendors are read, so this is not an
+NVIDIA-only panel: an AMD card comes from `amdgpu` sysfs (VRAM, use, clocks,
+temperature, power, PCIe link, `unique_id`, AER counters) and an Intel iGPU is
+reported with its driver, which is the device Jellyfin's VAAPI fallback depends
+on. `amd-smi` — or the older `rocm-smi` — is needed to *set* a limit, not to read
+one: without either, the card is shown and the slider is not offered.
 
 ## Modes
 
@@ -208,7 +242,7 @@ it usable from scripts.
 | `/api/status` | GET | Every card the host reports, the processes on them attributed by UUID, `inventory` (cards vs expected), `configured` (which consumers exist here), `auto`, Immich, Jellyfin, the router's models and ComfyUI's stats. |
 | `/api/mode/{llm,media,balanced,image}` | POST | The table above. |
 | `/api/auto` | POST | `enabled` and the three idle timers, `0…1440` minutes. |
-| `/api/power` | POST | `nvidia-smi -i <index> -pl`, per card. Bounded by what the cards report, and the answer says which ones refused. |
+| `/api/power` | POST | The vendor's own command per card (`nvidia-smi -i <index> -pl`, `amd-smi set --power-cap`), bounded by what the cards report. The answer says which ones refused and which ones a vendor exposes no limit for. |
 | `/api/llama/unload` | POST | Unload every resident model. |
 | `/api/llama/logs?lines=200` | GET | `journalctl` of the unit on `AI_HOST` (through `pct exec` when `AI_CTID` is set), capped at 2000 lines. |
 | `/api/comfy/{start,stop,restart}` | POST | The ComfyUI container on `AI_HOST`; skipped when `COMFY_CONTAINER` is empty. |
@@ -226,10 +260,13 @@ abridged and with the numbers shortened:
 {
   "gpu": {
     "index": "0", "uuid": "GPU-00000000-…", "name": "Tesla P100-PCIE-16GB",
-    "driver": "580.159.04", "mem_used": "14478", "mem_total": "16384",
+    "driver": "580.159.04", "vendor": "nvidia", "pci": "0000:01:00.0",
+    "mem_used": "14478", "mem_total": "16384",
     "util": "0", "util_max": 0, "temp": "39",
     "power_draw": "36.71", "power_limit": "200.00",
     "power_min": "125.00", "power_max": "250.00", "power_limits": ["200.00"],
+    "power_settable": true, "setter": "nvidia-smi",
+    "bus_visible": true, "driver_visible": true,
     "clk_sm": "1328", "clk_mem": "715", "pcie_gen": "3", "pcie_width": "16",
     "processes": [{"pid": "3331196", "name": "…/llama-server", "mem_mib": 14478, "gpu": "0"}]
   },
@@ -241,8 +278,15 @@ abridged and with the numbers shortened:
     "last_action_at": "2026-11-05 08:25:32"
   },
   "inventory": {
-    "count": 2, "expected": 2, "missing": 0, "last_change": null,
-    "present": [{"uuid": "GPU-00000000-…", "index": "0", "name": "Tesla P100-PCIE-16GB"}]
+    "count": 2, "expected": 2, "missing": 0, "state": "ok", "expected_ids": [],
+    "present": [{
+      "key": "GPU-00000000-…", "uuid": "GPU-00000000-…", "index": "0",
+      "name": "Tesla P100-PCIE-16GB", "pci": "0000:01:00.0", "vendor": "nvidia",
+      "driver": "580.159.04", "bus_visible": true, "driver_visible": true,
+      "power_settable": true, "aer": {"fatal": "0", "nonfatal": "0", "correctable": "0"}
+    }],
+    "absent": [], "flapping": [], "events": [], "last_change": null,
+    "probe": {"host_ok": true, "tools": {"nvidia-smi": true}, "errors": [], "nvidia_smi": "0"}
   },
   "configured": {"immich": true, "jellyfin": true, "comfyui": true, "comfyui_api": true, "llama_logs": true},
   "immich_ml": "running",
@@ -271,12 +315,16 @@ consumer that is down.
 | `PANEL_USER` | `admin` | |
 | `SESSION_TTL` | `604800` | Seconds. |
 | `LOGIN_DELAY` | `0.4` | Seconds burned on a bad password. |
+| `LOGIN_MAX_FAILURES` | `5` | Failed logins from one address before the answer is `429`. `0` disables it. |
+| `LOGIN_WINDOW` | `300` | Seconds the failures are counted over. |
 | `STATE_PATH` | `/state/auto.json` | Inside the named volume. |
 | `AI_HOST` | `GPU_HOST` | Where llama.cpp and ComfyUI run. |
 | `AI_CTID` | empty | Proxmox VM/CT id: commands run through `pct exec` there. Empty = on the host itself. |
 | `LLAMA_LOG_UNIT` | `llama-server` | The systemd unit whose journal is shown. |
 | `LLAMA_PUBLIC_MODELS` | empty | Comma-separated substrings. Empty names every model the router serves. |
-| `GPU_EXPECTED` | `0` | Cards the host should have. `0` reports what `nvidia-smi` answers without calling anything missing. |
+| `GPU_EXPECTED` | `0` | Cards the host should have. `0` reports what the probe answers without calling anything missing. |
+| `GPU_EXPECTED_IDS` | empty | The exact set: comma-separated PCI addresses (`0000:02:00.0`) or UUIDs. Names the missing card when a count cannot. |
+| `GPU_EVIDENCE` | `1` | Collect the kernel lines (`NVRM`, `Xid`, `AER`) around a change. `0` disables the extra SSH. |
 | `IMMICH_HOST` | empty | Empty = no Immich. |
 | `IMMICH_ML_CONTAINER` | `immich_machine_learning` | |
 | `IMMICH_PG_CONTAINER` | `immich_postgres` | Read for Immich's own ffmpeg settings. |
@@ -344,12 +392,17 @@ to replace.
 
 | Symptom | What it means |
 | --- | --- |
-| `502 nvidia-smi failed: … Permission denied (publickey)` | the key in `/root/.ssh` does not reach `GPU_HOST`; nothing else will work either |
+| `502 card probe failed: … Permission denied (publickey)` | the key in `/root/.ssh` does not reach `GPU_HOST`; nothing else will work either |
 | `502 … timed out after 30s` | a host is unreachable — the panel turns a timeout into a `502`, never a `500` |
 | everything reads `not configured` | those variables are empty on purpose; see [Adapting it to your setup](#adapting-it-to-your-setup) |
-| `1 of 2 · 1 card missing` | `GPU_EXPECTED` is above what `nvidia-smi` answers: the card is not initialising |
+| `1 of 2 · 1 card missing` | `GPU_EXPECTED` is above what the probe answers: the card is not initialising |
+| `no card answers` | the host replies and the driver lists no card: `nvidia-smi` fails, the module is unloaded, or every card is off the bus |
+| `driver does not see it` | the card is on the bus and `nvidia-smi` does not list it (`Xid 79`); the kernel lines under the alert say which |
+| `a card keeps going and coming back` | three or more drops in the hour: a link, a riser or a power problem, not a card that is simply absent |
+| `429 too many failed logins` | `LOGIN_MAX_FAILURES` failures within `LOGIN_WINDOW`; wait the window out |
 | `Power limit: not reported by the card` | the card exposes no settable range (typical on vGPU); the slider is disabled |
-| `N card(s) refused … W` | the limit was set on the cards that accept it; the others are named with their own `nvidia-smi` error |
+| `N card(s) refused … W` | the limit was set on the cards that accept it; the others are named with the driver's own error |
+| `Power limit: not settable` | no card on this host reports a range: an Intel iGPU, a vGPU, or an AMD card without `amd-smi`/`rocm-smi` |
 | signed out after changing a password or the token | the session key is derived from both, so rotating either revokes every cookie |
 | the browser keeps asking to log in behind a proxy | the cookie is `Secure` only when the request says HTTPS; forward `X-Forwarded-Proto` |
 | `403 cross-origin request rejected` | a write came from another origin with a session cookie; use the bearer token for scripts |
