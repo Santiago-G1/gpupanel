@@ -462,7 +462,8 @@ function renderInventory(inv) {
     html += `<div class="k" style="margin-top:8px">The card host said:
       <span class="mono">${esc(errors[0])}</span></div>`;
   }
-  box.classList.toggle('quiet', quiet);
+  // A quiet line must never carry the card host's own error message.
+  box.classList.toggle('quiet', quiet && !errors.length);
   box.style.display = html ? '' : 'none';
   box.innerHTML = html;
 }
