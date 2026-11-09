@@ -148,7 +148,7 @@ file, so a card that changed owner overnight can be explained afterwards.
 | Path | What it is |
 | --- | --- |
 | `app.py` | The whole service: config from the environment, auth, the GPU probes, the four modes and the auto-switch tick. |
-| `static/index.html` | The dashboard. Polls `/api/status`, never renders a model the router was not allowed to name. |
+| `static/index.html` | The dashboard. Polls `/api/status`; never renders a model the router — or the models folder — was not allowed to name (`LLAMA_PUBLIC_MODELS` filters both). |
 | `static/howto.html` | The guide served at `/howto`, same auth. |
 | `static/login.html` | The only page without a session, with its CSS inline so it loads unauthenticated. |
 | `static/panel.css` | Shared by the dashboard and the guide. |
@@ -239,7 +239,7 @@ it usable from scripts.
 | Endpoint | Method | What it does |
 | --- | --- | --- |
 | `/api/session` | GET | Who the caller is. The only probe that never leaves the container. |
-| `/api/status` | GET | Every card the host reports, the processes on them attributed by UUID, `inventory` (cards vs expected), `configured` (which consumers exist here), `auto`, Immich, Jellyfin, the router's models and ComfyUI's stats. |
+| `/api/status` | GET | Every card the host reports, the processes on them attributed by UUID, `inventory` (cards vs expected), `configured` (which consumers exist here), `auto`, Immich, Jellyfin, the router's models, the folder's models and ComfyUI's stats. |
 | `/api/mode/{llm,media,balanced,image}` | POST | The table above. |
 | `/api/auto` | POST | `enabled` and the three idle timers, `0…1440` minutes. |
 | `/api/power` | POST | The vendor's own command per card (`nvidia-smi -i <index> -pl`, `amd-smi set --power-cap`), bounded by what the cards report. The answer says which ones refused and which ones a vendor exposes no limit for. |
@@ -288,12 +288,14 @@ abridged and with the numbers shortened:
     "absent": [], "flapping": [], "events": [], "last_change": null,
     "probe": {"host_ok": true, "tools": {"nvidia-smi": true}, "errors": [], "nvidia_smi": "0"}
   },
-  "configured": {"immich": true, "jellyfin": true, "comfyui": true, "comfyui_api": true, "llama_logs": true},
+  "configured": {"immich": true, "jellyfin": true, "comfyui": true, "comfyui_api": true, "llama_logs": true,
+                 "llama_models_dir": true},
   "immich_ml": "running",
   "immich_ffmpeg": {"accel": "nvenc", "preferredHwDevice": ""},
   "jellyfin_accel": "vaapi",
   "llama": [{"id": "some-model", "status": "loaded"}],
   "llama_counts": {"total": 7, "loaded": 1},
+  "disk_models": [{"id": "some-model", "size": 22749880640, "mtime": 1793230206, "served": true, "loaded": true}],
   "comfyui": {"state": "created"}
 }
 ```
@@ -302,7 +304,16 @@ The readings are strings exactly as `nvidia-smi` prints them, `N/A` included; th
 two computed fields are `util_max` (an int) for the idle clock and `power_limits`
 (one per card) for the dashboard. A consumer that is not configured answers
 `"unconfigured"` instead of an object, so a client can tell it apart from a
-consumer that is down.
+consumer that is down. `disk_models` is `[]` until `LLAMA_MODELS_DIR` is set,
+and `{"error": …}` when the folder cannot be read; `served` and `loaded` are
+`false` for every row while the router does not answer.
+
+Each `disk_models` row is a `*.gguf` file one level inside the folder. `size` is
+the size of the file the name points at, not of the link: the listing is made
+with `find -L`, so a model that is a symlink into the pool reports the pool's
+size. `mmproj-*` projectors are left out, because the router does not publish
+them as models. The dashboard marks a row `●` loaded (which includes
+`loading`), `○` served but not loaded, and `·` on disk and not served.
 
 ## Configuration
 
@@ -322,6 +333,7 @@ consumer that is down.
 | `AI_CTID` | empty | Proxmox VM/CT id: commands run through `pct exec` there. Empty = on the host itself. |
 | `LLAMA_LOG_UNIT` | `llama-server` | The systemd unit whose journal is shown. |
 | `LLAMA_PUBLIC_MODELS` | empty | Comma-separated substrings. Empty names every model the router serves. |
+| `LLAMA_MODELS_DIR` | empty | Path of the models folder as llama.cpp sees it (inside `AI_CTID` when there is one), read over SSH. Empty = the disk is never read. |
 | `GPU_EXPECTED` | `0` | Cards the host should have. `0` reports what the probe answers without calling anything missing. |
 | `GPU_EXPECTED_IDS` | empty | The exact set: comma-separated PCI addresses (`0000:02:00.0`) or UUIDs. Names the missing card when a count cannot. |
 | `GPU_EVIDENCE` | `1` | Collect the kernel lines (`NVRM`, `Xid`, `AER`) around a change. `0` disables the extra SSH. |
@@ -341,7 +353,13 @@ consumer that is down.
 
 `LLAMA_PUBLIC_MODELS` is the only display filter: unlisted models still load and
 unload through the panel, they are just never printed — a count stands in for
-them. That keeps a model the lab does not advertise out of a screenshot.
+them. That keeps a model the lab does not advertise out of a screenshot. It
+hides files in `LLAMA_MODELS_DIR` the same way.
+
+The router and the folder answer different questions: the router says what it
+**serves**, the folder says what is **there**. With `LLAMA_MODELS_DIR` set,
+`/api/status` reports both crossed, so a model that is on disk but in no preset
+is visible instead of missing.
 
 ## Adapting it to your setup
 
@@ -353,6 +371,7 @@ Jellyfin and ComfyUI — and not at all about the machines they live on:
 | A card + the router | `GPU_HOST`, `LLAMA_URL`. Nothing else. |
 | llama.cpp on another host | `AI_HOST` |
 | …inside a Proxmox container | `AI_HOST` (the node) + `AI_CTID` |
+| The folder the models sit in | `LLAMA_MODELS_DIR`, as llama.cpp sees it |
 | Immich | `IMMICH_HOST` |
 | Jellyfin | `JELLYFIN_HOST` + `JELLYFIN_XML` |
 | ComfyUI in Docker | `COMFY_CONTAINER` (and `COMFY_URL` for its stats) |

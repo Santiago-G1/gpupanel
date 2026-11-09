@@ -27,6 +27,8 @@ services:
       - AI_HOST=${AI_HOST:-}
       - AI_CTID=${AI_CTID:-}
       - LLAMA_LOG_UNIT=${LLAMA_LOG_UNIT:-llama-server}
+      # The models folder, as llama.cpp sees it. Empty reads no disk.
+      - LLAMA_MODELS_DIR=${LLAMA_MODELS_DIR:-}
       # Optional display filter: only these model ids are ever named.
       - LLAMA_PUBLIC_MODELS=${LLAMA_PUBLIC_MODELS:-}
       # How many cards the node should have: 0 reports without judging.

@@ -104,6 +104,7 @@ def test_minimal_setup_reports_consumers_unconfigured(panel):
         "comfyui": False,
         "comfyui_api": False,
         "llama_logs": True,
+        "llama_models_dir": False,
     }
     assert status["immich_ml"] == "unconfigured"
     assert status["jellyfin_accel"] == "unconfigured"
@@ -327,6 +328,173 @@ def test_the_key_reaches_the_unload_call(monkeypatch, tmp_path):
     assert panel.llama_unload_all() == [{"model": "big", "http": 200}]
     assert seen[-1] == ("POST", "http://llama.test:8080/models/unload",
                         {"Authorization": "Bearer secret"}, {"model": "big"})
+
+
+# --- the models folder ------------------------------------------------------
+def test_the_folder_lists_its_models(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, LLAMA_MODELS_DIR="/mnt/models", AI_CTID="126")
+    seen = []
+
+    def fake_ssh(host, command, timeout=30):
+        seen.append((host, command))
+        return Proc(
+            "Qwen3-8B.gguf\t4096\t1700000002.5\n"
+            "mmproj-Qwen3-8B-f16.gguf\t931145984\t1700000001\n"
+            "spark-4b.gguf\t2048\t1700000000\n"
+        )
+
+    panel.ssh = fake_ssh
+    models = panel.models_on_disk()
+
+    # Sorted by id, the projector dropped, the fraction in %T@ gone.
+    assert models == [
+        {"id": "Qwen3-8B", "size": 4096, "mtime": 1700000002},
+        {"id": "spark-4b", "size": 2048, "mtime": 1700000000},
+    ]
+    # One round trip, inside the CT if there is one, and `-L`: a model that is a
+    # symlink into the pool must report the size of the file it points at.
+    assert len(seen) == 1
+    command = seen[0][1]
+    assert command.startswith("pct exec 126 -- find -L /mnt/models")
+    assert "-maxdepth 1 -type f -name '*.gguf'" in command
+
+
+def test_a_missing_folder_is_an_error_in_the_answer(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, LLAMA_MODELS_DIR="/mnt/nope")
+    stub_gpu(panel, card())
+
+    def fake_ssh(host, command, timeout=30):
+        if "find -L" in command:
+            return Proc(returncode=1, stderr="find: '/mnt/nope': No such file or directory")
+        return Proc()
+
+    panel.ssh = fake_ssh
+    # Non-zero with nothing on stdout is the one failure that is still an error:
+    # with rows, the listing wins (see test_a_failing_find_still_returns_what_it_printed).
+    with pytest.raises(RuntimeError, match="No such file"):
+        panel.models_on_disk()
+
+    status = panel.status("t")
+    assert status["disk_models"] == {"error": "find: '/mnt/nope': No such file or directory"}
+
+
+def test_the_folder_and_the_router_are_crossed(panel):
+    disk = [
+        {"id": "Alpha", "size": 10, "mtime": 1},
+        {"id": "beta", "size": 20, "mtime": 2},
+        {"id": "gamma", "size": 30, "mtime": 3},
+    ]
+    view = panel.disk_models_view(disk, [
+        {"id": "alpha", "status": "loaded"},
+        {"id": "BETA", "status": "loading"},
+    ])
+
+    assert [(m["id"], m["served"], m["loaded"]) for m in view] == [
+        ("Alpha", True, True),
+        ("beta", True, True),
+        ("gamma", False, False),
+    ]
+    # A router that did not answer costs the marks, never the listing.
+    assert [(m["served"], m["loaded"]) for m in panel.disk_models_view(disk, [])] == [(False, False)] * 3
+
+
+def test_the_folder_honours_the_public_filter(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, LLAMA_PUBLIC_MODELS="qwen")
+    disk = [{"id": "Qwen3-8B", "size": 1, "mtime": 1}, {"id": "Secret-70B", "size": 2, "mtime": 2}]
+
+    assert [m["id"] for m in panel.disk_models_view(disk, [])] == ["Qwen3-8B"]
+    # The same predicate, so a file and a router id are hidden alike.
+    assert panel.listed_models([{"id": "Secret-70B"}, {"id": "QWEN3-8B"}]) == [{"id": "QWEN3-8B"}]
+
+
+def test_the_models_folder_is_off_until_it_is_configured(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path)
+    stub_gpu(panel, card())
+    status = panel.status("t")
+
+    assert status["configured"]["llama_models_dir"] is False
+    assert status["disk_models"] == []
+
+    configured = load(monkeypatch, tmp_path, LLAMA_MODELS_DIR="/mnt/models")
+    stub_gpu(configured, card())
+    configured.ssh = lambda host, command, timeout=30: Proc("big.gguf\t2048\t1700000000\n")
+    status = configured.status("t")
+
+    assert status["configured"]["llama_models_dir"] is True
+    assert status["disk_models"] == [
+        {"id": "big", "size": 2048, "mtime": 1700000000, "served": False, "loaded": False}
+    ]
+
+
+def test_a_failing_find_still_returns_what_it_printed(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, LLAMA_MODELS_DIR="/mnt/models")
+    # A subdirectory the panel cannot read: `find` warns on stderr, exits
+    # non-zero, and the models beside it are still a listing.
+    panel.ssh = lambda host, command, timeout=30: Proc(
+        "ok.gguf\t1024\t1700000000\n",
+        returncode=1,
+        stderr="find: '/mnt/models/locked': Permission denied",
+    )
+
+    assert panel.models_on_disk() == [{"id": "ok", "size": 1024, "mtime": 1700000000}]
+
+
+def test_a_line_that_does_not_parse_does_not_take_the_listing(monkeypatch, tmp_path, caplog):
+    panel = load(monkeypatch, tmp_path, LLAMA_MODELS_DIR="/mnt/models")
+    panel.ssh = lambda host, command, timeout=30: Proc(
+        "good.gguf\t1024\t1700000000\n"
+        "four-fields.gguf\t1024\t1700000000\textra\n"
+        "bad-size.gguf\tsize\t1700000000\n"
+        "MMPROJ-Alpha-f16.gguf\t512\t1700000000\n"
+    )
+
+    assert [m["id"] for m in panel.models_on_disk()] == ["good"]
+    # Skipped, not silently: the line is named in the log.
+    assert "four-fields.gguf" in caplog.text
+    assert "bad-size.gguf" in caplog.text
+
+
+def test_a_router_id_with_a_path_or_an_extension_still_crosses(panel):
+    disk = [{"id": "x", "size": 1, "mtime": 1}]
+
+    for router_id in ("/mnt/models/x.gguf", "x.gguf", "X.GGUF", "x"):
+        view = panel.disk_models_view(disk, [{"id": router_id, "status": "loaded"}])
+        assert [(m["served"], m["loaded"]) for m in view] == [(True, True)], router_id
+    # The same normalisation on the folder's side, in case a name arrives dressed.
+    dressed = [{"id": "X.gguf", "size": 1, "mtime": 1}]
+    assert panel.disk_models_view(dressed, [{"id": "x", "status": "loading"}])[0]["served"] is True
+
+
+def test_the_folder_survives_a_router_that_raises(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, LLAMA_MODELS_DIR="/mnt/models")
+    stub_gpu(panel, card())
+
+    def dead_router():
+        raise RuntimeError("router down")
+
+    panel.llama_models = dead_router
+    panel.ssh = lambda host, command, timeout=30: Proc("big.gguf\t2048\t1700000000\n")
+    status = panel.status("t")
+
+    assert status["llama"] == {"error": "router down"}
+    # A listing with no marks, not an error: the folder did answer.
+    assert status["disk_models"] == [
+        {"id": "big", "size": 2048, "mtime": 1700000000, "served": False, "loaded": False}
+    ]
+
+
+def test_a_path_with_spaces_reaches_find_quoted(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, LLAMA_MODELS_DIR="/mnt/my models", AI_CTID="126")
+    seen = []
+
+    def fake_ssh(host, command, timeout=30):
+        seen.append(command)
+        return Proc()
+
+    panel.ssh = fake_ssh
+
+    assert panel.models_on_disk() == []
+    assert seen[0].startswith("pct exec 126 -- find -L '/mnt/my models' ")
 
 
 # --- inventory --------------------------------------------------------------

@@ -283,6 +283,18 @@ function llamaCounts(s) {
   return c;
 }
 
+// One row per file in the models folder: loaded, served, or just there.
+function diskRows(models) {
+  const rows = models.map(m => {
+    const mark = m.loaded ? '●' : (m.served ? '○' : '·');
+    // A file name is text, and a size that is not a number is zero, not NaN GB.
+    const gb = (Number(m.size) || 0) / 1073741824;
+    return `<div class="mono" style="font-size:12px">${mark} ${esc(m.id)} · ${gb.toFixed(1)} GB</div>`;
+  }).join('');
+  const served = models.filter(m => m.served).length;
+  return rows + `<div class="k" style="font-size:12px">${models.length} on disk · ${served} served</div>`;
+}
+
 // State derived from what the probes report.
 function deriveMode(s) {
   // ComfyUI keeps the card while it is up, so it wins over every other reading.
@@ -540,9 +552,15 @@ async function refresh() {
   const lp = $('llama-pill');
   lp.textContent = counts.loaded ? counts.loaded + ' loaded' : 'no model';
   lp.className = 'pill ' + (counts.loaded ? 'ok' : 'off');
-  $('llama-list').innerHTML = llama.length
-    ? llama.map(m => `<div class="mono" style="font-size:12px">${m.status === 'loaded' ? '●' : '○'} ${m.id}</div>`).join('')
+  // A folder the panel could not read is a line of its own, above the router's
+  // list: the error costs the listing, never the marks the router can still give.
+  const disk = s.disk_models;
+  const diskError = disk && !Array.isArray(disk) && disk.error
+    ? `<span class="k">models folder: ${esc(disk.error)}</span>` : '';
+  const routerRows = llama.length
+    ? llama.map(m => `<div class="mono" style="font-size:12px">${m.status === 'loaded' ? '●' : '○'} ${esc(m.id)}</div>`).join('')
     : '<span class="k">no response</span>';
+  $('llama-list').innerHTML = Array.isArray(disk) && disk.length ? diskRows(disk) : diskError + routerRows;
 
   const ml = typeof s.immich_ml === 'string' ? s.immich_ml : (s.immich_ml?.error ? 'error' : '—');
   const mp = $('ml-pill');

@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import secrets
+import shlex
 import subprocess
 import threading
 import time
@@ -100,6 +101,9 @@ AI_HOST = optional("AI_HOST") or GPU_HOST
 AI_CTID = optional("AI_CTID")
 LLAMA_LOG_UNIT = optional("LLAMA_LOG_UNIT") or "llama-server"
 LLAMA_LOG_MAX = 2000
+# The folder the models live in, as llama.cpp sees it: inside the CT when there
+# is an AI_CTID, on AI_HOST otherwise. Empty means the panel never reads a disk.
+LLAMA_MODELS_DIR = optional("LLAMA_MODELS_DIR")
 
 # The panel's own credentials. Both are required: an empty password would leave
 # the panel unloggable, and an empty token would sign every session with a key
@@ -802,11 +806,82 @@ def llama_logs(lines=200):
     return [line for line in p.stdout.splitlines() if line.strip()]
 
 
+def models_on_disk():
+    """The .gguf files in LLAMA_MODELS_DIR, as llama.cpp sees them.
+
+    `-L` is what makes this useful: several models here are symlinks into the
+    pool, and without it `%s` is the size of the link, not of the file.
+    """
+    command = (
+        f"find -L {shlex.quote(LLAMA_MODELS_DIR)} -maxdepth 1 -type f -name '*.gguf' "
+        "-printf '%f\\t%s\\t%T@\\n'"
+    )
+    # Eight seconds: the dashboard polls every five, and PROBE_POOL has six
+    # workers for six probes, so a probe slower than the poll never gives its
+    # worker back. A hung SSH is not worth the whole card.
+    p = ssh(AI_HOST, ai_cmd(command), timeout=8)
+    rows = [line for line in p.stdout.splitlines() if line.strip()]
+    models = []
+    for line in rows:
+        parts = line.split("\t")
+        if len(parts) != 3:
+            log.warning("models folder: skipping unreadable line %r", line)
+            continue
+        name, size, mtime = parts
+        try:
+            model = {"id": name.removesuffix(".gguf"), "size": int(size), "mtime": int(float(mtime))}
+        except ValueError:
+            log.warning("models folder: skipping unreadable line %r", line)
+            continue
+        # A projector is not a model: the router does not publish it as one.
+        if not name.lower().startswith("mmproj"):
+            models.append(model)
+    # A folder with one unreadable subdirectory still lists the rest: `find`
+    # says so on stderr and exits non-zero, but what it printed is a listing.
+    if p.returncode != 0:
+        if not rows:
+            raise RuntimeError((p.stderr or p.stdout).strip() or "find failed")
+        log.debug("find -L %s exited %s: %s", LLAMA_MODELS_DIR, p.returncode,
+                  (p.stderr or p.stdout).strip())
+    return sorted(models, key=lambda m: m["id"])
+
+
+def public_model(model):
+    """Whether the panel may name this id at all (see LLAMA_PUBLIC_MODELS)."""
+    if not LLAMA_PUBLIC_MODELS:
+        return True
+    name = str(model.get("id", "")).lower()
+    return any(p in name for p in LLAMA_PUBLIC_MODELS)
+
+
 def listed_models(models):
     """Keep only the models the panel is allowed to name (see LLAMA_PUBLIC_MODELS)."""
-    if not LLAMA_PUBLIC_MODELS:
-        return list(models)
-    return [m for m in models if any(p in str(m.get("id", "")).lower() for p in LLAMA_PUBLIC_MODELS)]
+    return [m for m in models if public_model(m)]
+
+
+def model_key(name):
+    """A model's name on both sides: no directory, no `.gguf`, no case.
+
+    The router answers with whatever its presets say (`x`, `x.gguf`, a full
+    path); the folder answers with `%f`, already bare.
+    """
+    base = str(name or "").rsplit("/", 1)[-1]
+    if base.lower().endswith(".gguf"):
+        base = base[:-len(".gguf")]
+    return base.lower()
+
+
+def disk_models_view(models, served=()):
+    """The folder says what there is, the router what it serves: mark both.
+
+    A router that does not answer costs the marks, never the listing.
+    """
+    states = {model_key(m.get("id")): str(m.get("status") or "") for m in served or ()}
+    view = []
+    for model in listed_models(models):
+        key = model_key(model.get("id"))
+        view.append({**model, "served": key in states, "loaded": states.get(key, "").startswith("load")})
+    return view
 
 
 def model_names(models):
@@ -1484,14 +1559,22 @@ def status(_: str = Depends(require_auth)):
         "comfyui": COMFY,
         "comfyui_api": COMFY_API,
         "llama_logs": bool(AI_HOST),
+        "llama_models_dir": bool(LLAMA_MODELS_DIR),
     }
-    for key, value in gather_probes({
+    jobs = {
         "immich_ml": immich_ml_state,
         "immich_ffmpeg": immich_transcode,
         "jellyfin_accel": jellyfin_accel,
         "llama": llama_models,
         "comfyui": comfy_stats,
-    }).items():
+    }
+    if LLAMA_MODELS_DIR:
+        jobs["disk"] = models_on_disk
+    probes = gather_probes(jobs)
+    # Popped before the loop: the answers land under their own name (`llama`),
+    # and this one is crossed with the router's before it is published.
+    disk = probes.pop("disk", [])
+    for key, value in probes.items():
         # Each answer is kept, including the ones that are exceptions: a probe
         # that failed is a reading too, and it is not worth a 500.
         if isinstance(value, Exception):
@@ -1509,6 +1592,10 @@ def status(_: str = Depends(require_auth)):
             "total": len(models),
             "loaded": sum(1 for model in models if model["status"] == "loaded"),
         }
+    if isinstance(disk, Exception):
+        out["disk_models"] = {"error": str(disk)}
+    else:
+        out["disk_models"] = disk_models_view(disk, models if isinstance(models, list) else [])
     comfyui = out.get("comfyui")
     if not isinstance(comfyui, dict):
         out["comfyui"] = {"state": "unknown", "error": "unexpected answer"}
