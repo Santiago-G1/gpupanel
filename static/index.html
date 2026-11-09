@@ -446,7 +446,7 @@ function renderInventory(inv) {
       <b style="color:var(--fg)">${Math.max(expected - count, 0)} card${expected - count === 1 ? '' : 's'} missing</b>
       <div class="k" style="margin-top:8px">The driver answers with ${count}, so one is not initialising:
         the panel cannot fix that.</div>`;
-  } else if (change && change.kind === 'added') {
+  } else if (change && change.kind === 'added' && Date.now() / 1000 - Number(change.ts || 0) < 900) {
     html = `<span class="pill ok">new card</span> ${whereCard(change)}
       <span class="k">came up ${esc(change.at)}${expected ? ` — ${count} of ${expected} now` : ''}</span>${evidence(change)}`;
   } else if (expected) {
@@ -462,8 +462,10 @@ function renderInventory(inv) {
     html += `<div class="k" style="margin-top:8px">The card host said:
       <span class="mono">${esc(errors[0])}</span></div>`;
   }
-  // A quiet line must never carry the card host's own error message.
-  box.classList.toggle('quiet', quiet && !errors.length);
+  // A quiet line must never carry the card host's own error message, nor hide a
+  // card the driver stopped listing: that one is not "all fine".
+  const blind = (inv.present || []).filter((c) => c.driver_visible === false).length;
+  box.classList.toggle('quiet', quiet && !errors.length && !blind);
   box.style.display = html ? '' : 'none';
   box.innerHTML = html;
 }
@@ -476,7 +478,7 @@ async function refresh() {
     // A card host that does not answer is not a card set of zero: it is a host
     // problem, and the panel says which one.
     $('gpu-name').textContent = 'card host unreachable';
-    renderInventory({state: 'unreachable', count: 0, desired: 0,
+    renderInventory({state: 'unreachable', count: 0, expected: 0,
       probe: {errors: [String(e.message || e)]}});
     return;
   }
