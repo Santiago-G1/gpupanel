@@ -90,6 +90,10 @@
 h2, .card { scroll-margin-top:12px; }
 h2 a, .k a { color:var(--acc); text-decoration:none; }
 h2 a:hover, .k a:hover { text-decoration:underline; }
+/* The inventory banner keeps the same 14px rhythm as the per-card blocks it
+   sits above, and the "all fine" line drops the card chrome entirely. */
+#gpu-alert { margin-bottom:14px; }
+#gpu-alert.quiet { padding:0; background:none; border-color:transparent; }
 @media (max-width:760px){
   .shell { grid-template-columns:1fr; }
   .side { display:flex; gap:4px; overflow-x:auto; border-right:0;

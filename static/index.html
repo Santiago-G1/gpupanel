@@ -418,6 +418,9 @@ function renderInventory(inv) {
   const errors = ((inv.probe || {}).errors || []).filter(Boolean);
   const change = events.length ? events[events.length - 1] : (inv.last_change || null);
   let html = '';
+  // "Everything is fine" is a line of text, not a card: a full card there sat
+  // flush on top of GPU 0 and read as if it were covering it.
+  let quiet = false;
 
   if (health === 'empty') {
     html = `<span class="pill off">0${expected ? ' of ' + expected : ''}</span>
@@ -447,9 +450,11 @@ function renderInventory(inv) {
     html = `<span class="pill ok">new card</span> ${whereCard(change)}
       <span class="k">came up ${esc(change.at)}${expected ? ` — ${count} of ${expected} now` : ''}</span>${evidence(change)}`;
   } else if (expected) {
+    quiet = true;
     html = `<span class="pill ok">${count} of ${expected}</span>
       <span class="k">cards answering${change && change.at ? ` · last change ${esc(change.at)}` : ''}</span>`;
   } else if (count) {
+    quiet = true;
     html = `<span class="pill ok">${count}</span>
       <span class="k">card${count === 1 ? '' : 's'} answering${change && change.at ? ` · last change ${esc(change.at)}` : ''}</span>`;
   }
@@ -457,6 +462,7 @@ function renderInventory(inv) {
     html += `<div class="k" style="margin-top:8px">The card host said:
       <span class="mono">${esc(errors[0])}</span></div>`;
   }
+  box.classList.toggle('quiet', quiet);
   box.style.display = html ? '' : 'none';
   box.innerHTML = html;
 }
