@@ -103,14 +103,12 @@ def test_minimal_setup_reports_consumers_unconfigured(panel):
         "jellyfin": False,
         "comfyui": False,
         "comfyui_api": False,
-        "hermes_webui": False,
         "llama_logs": True,
         "llama_models_dir": False,
     }
     assert status["immich_ml"] == "unconfigured"
     assert status["jellyfin_accel"] == "unconfigured"
     assert status["comfyui"]["state"] == "unconfigured"
-    assert status["hermes_webui"] == {"state": "unconfigured", "url": ""}
     assert status["immich_ffmpeg"] == {}
     assert status["inventory"]["count"] == 1
     assert status["inventory"]["expected"] == 0
@@ -947,85 +945,3 @@ def test_a_stopped_comfyui_is_not_asked_twice_in_a_row(monkeypatch, tmp_path):
     assert len(calls) == 1
     assert panel.comfy_state(force=True) == "created"
     assert len(calls) == 2
-
-
-# --- the agent's web UI -----------------------------------------------------
-def _webui(monkeypatch, tmp_path, **env):
-    return load(monkeypatch, tmp_path, HERMES_WEBUI_CONTAINER="hermes", AI_CTID="126", **env)
-
-
-def test_the_web_ui_state_is_what_s6_says(monkeypatch, tmp_path):
-    panel = _webui(monkeypatch, tmp_path)
-    seen = []
-
-    def fake_ssh(host, command, timeout=30):
-        seen.append(command)
-        return Proc("true\n")
-
-    panel.ssh = fake_ssh
-    assert panel.hermes_webui_state() == "up"
-    # One command, inside the CT, and `-o up`: the human form of s6-svstat says
-    # `down (exitcode 0)` or `down (signal SIGTERM)` and parsing it is a trap.
-    assert seen == ["pct exec 126 -- docker exec hermes /command/s6-svstat -o up /run/service/dashboard"]
-
-    panel.ssh = lambda host, command, timeout=30: Proc("false\n")
-    assert panel.hermes_webui_state(force=True) == "down"
-
-
-def test_the_service_name_is_configurable(monkeypatch, tmp_path):
-    panel = load(monkeypatch, tmp_path, HERMES_WEBUI_CONTAINER="agent", HERMES_WEBUI_SERVICE="webui")
-    seen = []
-    panel.ssh = lambda host, command, timeout=30: (seen.append(command), Proc("true\n"))[1]
-
-    panel.hermes_webui_state()
-    assert seen == ["docker exec agent /command/s6-svstat -o up /run/service/webui"]
-
-
-def test_a_broken_web_ui_probe_is_not_a_state(monkeypatch, tmp_path):
-    panel = _webui(monkeypatch, tmp_path)
-    panel.ssh = lambda host, command, timeout=30: Proc("", 100, "s6-svstat: fatal: nope")
-    stub_gpu(panel, card())
-
-    with pytest.raises(RuntimeError):
-        panel.hermes_webui_state()
-    # The status keeps the reading instead of a 500, like every other probe.
-    assert "s6-svstat: fatal: nope" in panel.status("t")["hermes_webui"]["error"]
-
-
-def test_the_web_ui_is_started_and_stopped_through_s6(monkeypatch, tmp_path):
-    panel = _webui(monkeypatch, tmp_path)
-    seen = []
-    panel.ssh = lambda host, command, timeout=30: (seen.append(command), Proc("true\n"))[1]
-
-    assert panel.hermes_webui("stop")["state"] == "up"  # the probe answers `true`
-    assert "/command/s6-svc -d /run/service/dashboard" in seen[-2]
-
-    seen.clear()
-    panel.hermes_webui("start")
-    assert "/command/s6-svc -u /run/service/dashboard" in seen[0]
-
-    seen.clear()
-    panel.hermes_webui("restart")
-    flags = [c.split("s6-svc ")[1][:2] for c in seen if "s6-svc" in c]
-    assert flags == ["-d", "-u"]
-
-
-def test_the_web_ui_actions_are_refused_when_they_make_no_sense(monkeypatch, tmp_path):
-    panel = _webui(monkeypatch, tmp_path)
-    with pytest.raises(panel.HTTPException) as bad:
-        panel.hermes_webui("toggle")
-    assert bad.value.status_code == 400
-
-    unconfigured = load(monkeypatch, tmp_path)
-    assert unconfigured.hermes_webui("start") == {
-        "action": "start", "skipped": "the agent's web UI is not configured"}
-
-
-def test_the_web_ui_address_comes_with_its_state(monkeypatch, tmp_path):
-    panel = _webui(monkeypatch, tmp_path, HERMES_WEBUI_UI_URL="https://hermes.test/")
-    stub_gpu(panel, card())
-    panel.ssh = lambda host, command, timeout=30: Proc("true\n")
-
-    status = panel.status("t")
-    assert status["configured"]["hermes_webui"] is True
-    assert status["hermes_webui"] == {"state": "up", "url": "https://hermes.test/"}

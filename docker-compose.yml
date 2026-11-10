@@ -46,10 +46,6 @@ services:
       - JELLYFIN_CONTAINER=${JELLYFIN_CONTAINER:-}
       - JELLYFIN_FALLBACK=${JELLYFIN_FALLBACK:-vaapi}
       - COMFY_CONTAINER=${COMFY_CONTAINER:-}
-      # The agent's web UI: an s6 service inside its container, moved by the panel.
-      - HERMES_WEBUI_CONTAINER=${HERMES_WEBUI_CONTAINER:-}
-      - HERMES_WEBUI_SERVICE=${HERMES_WEBUI_SERVICE:-dashboard}
-      - HERMES_WEBUI_UI_URL=${HERMES_WEBUI_UI_URL:-}
       # COMFY_URL is the LAN address: in its own container 127.0.0.1 is itself.
       - COMFY_URL=${COMFY_URL:-}
       - COMFY_UI_URL=${COMFY_UI_URL:-}

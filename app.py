@@ -133,11 +133,6 @@ JELLYFIN_XML = optional("JELLYFIN_XML")
 JELLYFIN_CONTAINER = optional("JELLYFIN_CONTAINER") or "jellyfin"
 
 # ComfyUI: a container to start and stop, its API for the queue depth, or both.
-# The agent's web UI is an s6 service inside its container, next to the gateway:
-# the panel moves the service, not the container, so channels and models stay up.
-HERMES_WEBUI_CONTAINER = optional("HERMES_WEBUI_CONTAINER")
-HERMES_WEBUI_SERVICE = optional("HERMES_WEBUI_SERVICE") or "dashboard"
-HERMES_WEBUI_UI_URL = optional("HERMES_WEBUI_UI_URL")
 COMFY_CONTAINER = optional("COMFY_CONTAINER")
 COMFY_URL = optional("COMFY_URL")
 COMFY_UI_URL = optional("COMFY_UI_URL")
@@ -146,7 +141,6 @@ COMFY_UI_URL = optional("COMFY_UI_URL")
 # switch logic never claims an action it did not take.
 IMMICH = bool(IMMICH_HOST)
 JELLYFIN = bool(JELLYFIN_HOST and JELLYFIN_XML)
-WEBUI = bool(HERMES_WEBUI_CONTAINER)
 COMFY = bool(COMFY_CONTAINER)
 COMFY_API = bool(COMFY_URL)
 
@@ -939,53 +933,6 @@ def comfy_state(force=False):
     return value
 
 
-WEBUI_STATE_TTL = 5
-WEBUI_STATE = {"at": 0.0, "value": None}
-
-
-def hermes_webui_state(force=False):
-    """`up`/`down` from s6's own view of the slot, `unconfigured` without a container.
-
-    `s6-svstat -o up` prints exactly `true`/`false`: the human form of the same
-    command says `down (exitcode 0)` or `down (signal SIGTERM)` depending on how
-    the slot died, and parsing that is how a probe starts lying.
-    """
-    if not WEBUI:
-        return "unconfigured"
-    now = time.time()
-    if not force and WEBUI_STATE["value"] and now - WEBUI_STATE["at"] < WEBUI_STATE_TTL:
-        return WEBUI_STATE["value"]
-    p = ssh(AI_HOST, ai_cmd(
-        f"docker exec {HERMES_WEBUI_CONTAINER} /command/s6-svstat -o up "
-        f"/run/service/{HERMES_WEBUI_SERVICE}"))
-    raw = p.stdout.strip()
-    if p.returncode != 0 or raw not in ("true", "false"):
-        raise RuntimeError((p.stderr or p.stdout).strip() or "s6-svstat failed")
-    value = "up" if raw == "true" else "down"
-    WEBUI_STATE.update({"at": now, "value": value})
-    return value
-
-
-def hermes_webui_stats():
-    """The slot's state plus the address of the dashboard, like `comfyui`."""
-    return {"state": hermes_webui_state(), "url": HERMES_WEBUI_UI_URL}
-
-
-def hermes_webui(action):
-    if action not in ("start", "stop", "restart"):
-        raise HTTPException(400, "action must be start, stop or restart")
-    if not WEBUI:
-        return {"action": action, "skipped": "the agent's web UI is not configured"}
-    # restart is stop-then-start: the service has no restart signal of its own.
-    for flag in (["-d"] if action == "stop" else ["-u"] if action == "start" else ["-d", "-u"]):
-        p = ssh(AI_HOST, ai_cmd(
-            f"docker exec {HERMES_WEBUI_CONTAINER} /command/s6-svc {flag} "
-            f"/run/service/{HERMES_WEBUI_SERVICE}"), timeout=90)
-        if p.returncode != 0:
-            raise HTTPException(502, (p.stderr or p.stdout).strip() or "s6-svc failed")
-    return {"action": action, "ok": True, "state": hermes_webui_state(force=True)}
-
-
 def comfy(action):
     if action not in ("start", "stop", "restart"):
         raise HTTPException(400, "action must be start, stop or restart")
@@ -1611,7 +1558,6 @@ def status(_: str = Depends(require_auth)):
         "jellyfin": JELLYFIN,
         "comfyui": COMFY,
         "comfyui_api": COMFY_API,
-        "hermes_webui": WEBUI,
         "llama_logs": bool(AI_HOST),
         "llama_models_dir": bool(LLAMA_MODELS_DIR),
     }
@@ -1621,7 +1567,6 @@ def status(_: str = Depends(require_auth)):
         "jellyfin_accel": jellyfin_accel,
         "llama": llama_models,
         "comfyui": comfy_stats,
-        "hermes_webui": hermes_webui_stats,
     }
     if LLAMA_MODELS_DIR:
         jobs["disk"] = models_on_disk
@@ -1827,11 +1772,6 @@ def llama_logs_api(lines: int = 200, _: str = Depends(require_auth)):
         "count": len(out),
         "lines": out,
     }
-
-
-@app.post("/api/hermes-webui/{action}")
-def hermes_webui_action(action: str, _: str = Depends(require_auth)):
-    return hermes_webui(action)
 
 
 @app.post("/api/comfy/{action}")
