@@ -21,6 +21,7 @@
   <a href="#modes">GPU modes</a>
   <a href="#consumers">Consumers</a>
   <a href="#comfy">ComfyUI</a>
+  <a href="#webui">Agent web UI</a>
   <a href="#jellyfin">Jellyfin</a>
   <a href="#auto">Auto-switch</a>
   <a href="#logs">llama.cpp logs</a>
@@ -113,6 +114,21 @@
     </div>
     <div class="k" style="margin-top:6px">
       <a href="/howto#comfy">How to generate images →</a>
+    </div>
+  </div>
+
+  <h2 id="webui">Agent web UI <span class="pill" id="webui-pill">—</span></h2>
+  <div class="card">
+    <div class="row" id="webui">
+      <button class="on" data-webui="start">Start</button>
+      <button data-webui="restart">Restart</button>
+      <button class="warn" data-webui="stop">Stop</button>
+      <button id="webui-open">Open the dashboard ↗</button>
+    </div>
+    <div class="k" style="margin-top:10px">
+      An s6 service inside the agent's container: stopping it leaves the gateway,
+      its channels and the models alone. The playbook starts it again on the next
+      deploy if <code>hermes_webui</code> says so.
     </div>
   </div>
 
@@ -340,6 +356,7 @@ function paintState(s) {
   unavailable('#ml button', !cfg.immich);
   unavailable('#jf button', !cfg.jellyfin);
   unavailable('#comfy button[data-comfy]', !cfg.comfyui);
+  unavailable('#webui button[data-webui]', !cfg.hermes_webui);
 
   $('llama-unload').disabled = llamaCounts(s).loaded === 0;
 
@@ -599,6 +616,16 @@ async function refresh() {
   open.disabled = !comfy.url;
   open.dataset.url = comfy.url || '';
 
+  const webui = str((s.hermes_webui || {}).state) || 'unknown';
+  const wp = $('webui-pill');
+  wp.textContent = webui === 'unconfigured' ? 'not configured' : webui;
+  wp.className = 'pill ' + (webui === 'unconfigured' ? '' : (webui === 'up' ? 'ok' : 'off'));
+  pressed('#webui button[data-webui]', (d) => (d.webui === 'start' && webui === 'up')
+                                          || (d.webui === 'stop' && webui !== 'up'));
+  const wopen = $('webui-open');
+  wopen.disabled = !(s.hermes_webui || {}).url;
+  wopen.dataset.url = (s.hermes_webui || {}).url || '';
+
   // The real state wins once the action finishes, so a failure falls back.
   if (!inflight) paintState(s);
 }
@@ -662,6 +689,23 @@ document.querySelectorAll('#comfy button[data-comfy]').forEach((b) => {
       {group: '#comfy', pending: 'ComfyUI: ' + action + '…', done: 'ComfyUI: ' + action});
   };
 });
+
+document.querySelectorAll('#webui button[data-webui]').forEach((b) => {
+  b.onclick = () => {
+    const action = b.dataset.webui;
+    const state = str(last && last.hermes_webui && last.hermes_webui.state);
+    if (action === 'start' && state === 'up') return skip('The web UI is already up');
+    if (action === 'stop' && state === 'down') return skip('The web UI is already down');
+    pressed('#webui button[data-webui]', (d) => d.webui === action && action !== 'restart');
+    act(b, '/api/hermes-webui/' + action, null,
+      {group: '#webui', pending: 'Agent web UI: ' + action + '…', done: 'Agent web UI: ' + action});
+  };
+});
+
+$('webui-open').onclick = () => {
+  const url = $('webui-open').dataset.url;
+  if (url) window.open(url, '_blank', 'noopener');
+};
 
 $('comfy-open').onclick = () => {
   const url = $('comfy-open').dataset.url;

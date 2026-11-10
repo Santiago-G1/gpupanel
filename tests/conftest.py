@@ -23,7 +23,7 @@ BASE = {
 
 # Everything `app` reads. A test that wants a different setup starts from an
 # empty board, which is also what the container gets.
-PREFIXES = ("PANEL_", "IMMICH_", "JELLYFIN_", "COMFY_", "LLAMA_", "AI_", "GPU_", "SESSION_", "LOGIN_", "STATE_")
+PREFIXES = ("PANEL_", "IMMICH_", "JELLYFIN_", "COMFY_", "HERMES_", "LLAMA_", "AI_", "GPU_", "SESSION_", "LOGIN_", "STATE_")
 OLD_NAMES = {"PVE_HOST", "FRONTEND_HOST"}
 
 
