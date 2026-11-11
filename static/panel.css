@@ -57,6 +57,17 @@
   .pill.ok { color:var(--ok); border-color:#1d3d24; }
   .pill.off { color:var(--bad); border-color:#4a2323; }
   .pill.acc { color:var(--acc); border-color:#1d3a5e; }
+  /* One --vendor per vendor: NVIDIA green, AMD red, Intel blue, and the muted
+     one for a card the probe could not name. */
+  .vendor-nvidia { --vendor:#3fb950; }
+  .vendor-amd { --vendor:#f85149; }
+  .vendor-intel { --vendor:#58a6ff; }
+  .vendor-unknown { --vendor:var(--mut); }
+  /* One block per card. The left border and the vendor pill both read --vendor,
+     so the accent and the label cannot disagree about the card. */
+  .gpu-block { margin-bottom:14px; padding-left:12px;
+               border-left:3px solid var(--vendor,var(--line)); }
+  .gpu-block .pill.vendor-tag { color:var(--vendor); border-color:currentColor; }
   input[type=range] { width:100%; }
   input[type=number] { background:#0b0e13; color:var(--fg); border:1px solid var(--line);
                        border-radius:6px; padding:5px 7px; }

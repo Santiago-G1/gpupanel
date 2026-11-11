@@ -496,14 +496,17 @@ async function refresh() {
     const link = x.pcie_gen && x.pcie_gen !== 'N/A'
       ? `PCIe Gen${x.pcie_gen} ×${x.pcie_width}` : '';
     const vendor = VENDORS[x.vendor] || x.vendor || '';
+    // The colour comes from the vendor the probe reported, never from the label:
+    // a card it could not name is the neutral one, not an empty class.
+    const vkey = VENDORS[x.vendor] ? x.vendor : 'unknown';
     // A card on the bus that the driver does not list is a card the driver lost,
     // which is a different problem from a card that is not in the machine.
     const blind = x.driver_visible === false;
     const offBus = x.bus_visible === false;
-    return `<div style="margin-bottom:14px">
+    return `<div class="gpu-block vendor-${vkey}">
       <div class="k" style="margin:0 0 6px">
         <b style="color:var(--fg)">GPU ${esc(x.index ?? '—')}</b>
-        ${vendor ? `<span class="pill">${esc(vendor)}</span>` : ''}
+        ${vendor ? `<span class="pill vendor-tag">${esc(vendor)}</span>` : ''}
         ${blind ? '<span class="pill off">driver does not see it</span>' : ''}
         ${offBus ? '<span class="pill off">not on the bus</span>' : ''}
         <span class="mono"> · ${esc(x.pci || '')}${x.pci ? ' · ' : ''}${link}${link ? ' · ' : ''}${reading(x.mem_total, 'MiB')}</span>
