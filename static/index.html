@@ -40,6 +40,7 @@
       <input type="range" id="pl" min="125" max="250" step="5" value="150">
       <span class="mono" id="pl-val">150 W</span>
       <button class="pri" id="pl-apply">Apply</button>
+      <button id="pl-factory">Factory limits</button>
       <button id="pl-adv" aria-pressed="false" aria-controls="pl-advanced">Advanced</button>
     </div>
     <div id="pl-advanced" hidden>
@@ -64,6 +65,9 @@
     <div class="k" style="margin-top:10px">GPU idle for <b id="idle-s" class="mono">—</b></div>
     <div class="k">State: <b id="llm-mode-state" class="mono">—</b></div>
     <div class="k">Last automatic action: <b id="last-action" class="mono">—</b></div>
+    <div class="row" style="margin-top:10px">
+      <button id="reset-settings" title="Timers and auto-switch back to their defaults. The power limits are forgotten, not applied.">Reset settings to defaults</button>
+    </div>
   </div>
 
   <h2>Processes on the GPU</h2>
@@ -585,6 +589,17 @@ async function refresh() {
     ? `${plMin}–${plMax} W` : 'not reported by any card';
   const pl = $('pl');
   pl.disabled = plMin === null || plMax === null;
+
+  // "Factory" is the manufacturer's limit, which is not the lower cap a host
+  // boots with: the number is on the button so nobody presses it blind.
+  const factory = $('pl-factory');
+  const defaults = settableCards().map((x) => num(x.power_default)).filter((w) => w !== null);
+  const one = defaults.length > 0 && defaults.every((w) => w === defaults[0]) ? defaults[0] : null;
+  factory.textContent = one !== null ? 'Factory (' + one + ' W)' : 'Factory limits';
+  factory.disabled = defaults.length === 0;
+  factory.title = defaults.length
+    ? 'Set every card back to the limit it shipped with'
+    : 'No card on this host reports a factory limit';
   if (plMin !== null && plMax !== null) {
     pl.min = plMin; pl.max = plMax;
     // A default of 150 W is outside the range of some cards.
@@ -659,6 +674,19 @@ async function refresh() {
 }
 
 /* ----------------------------------------------------------------- actions */
+$('pl-factory').onclick = async () => {
+  const r = await act($('pl-factory'), '/api/power/factory', null,
+    {pending: 'Restoring the factory limits…', done: 'Factory limits applied'});
+  const bad = (r && Array.isArray(r.cards) ? r.cards : []).filter((c) => c.ok === false);
+  if (bad.length) {
+    msg('GPU ' + bad.map((c) => c.index).join(', ') + ' refused the factory limit: '
+        + (bad[0].error || 'the driver said no'), true);
+  }
+};
+
+$('reset-settings').onclick = () => act($('reset-settings'), '/api/reset', null,
+  {pending: 'Resetting the settings…', done: 'Settings back to their defaults'});
+
 $('pl-adv').onclick = () => {
   const box = $('pl-advanced');
   const open = box.hidden;

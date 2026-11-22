@@ -11,6 +11,7 @@ Auth is a signed session cookie plus a bearer token for automation.
 import asyncio
 import base64
 import contextlib
+import copy
 import hashlib
 import hmac
 import json
@@ -1867,6 +1868,53 @@ def set_power(body: dict = Body(...), _: str = Depends(require_auth)):
     if advanced is None:
         out["watts"] = asked[results[0]["index"]]
     return out
+
+
+@app.post("/api/power/factory")
+def power_factory(_: str = Depends(require_auth)):
+    """Put every settable card back on the limit it shipped with.
+
+    `power.default_limit` is the manufacturer's own value (250 W on a P100), not
+    the lower cap a host may boot with. The saved limits are forgotten in the
+    same breath, so the next start does not undo it.
+    """
+    cards = gpu_status()["gpus"]
+    planned, skipped = [], []
+    for card in cards:
+        watts = as_number(card.get("power_default"), None)
+        if watts is None or not power_command(card, watts):
+            skipped.append(card.get("index"))
+            continue
+        planned.append((card, int(watts), power_command(card, int(watts))))
+    if not planned:
+        raise HTTPException(400, "no card on this host reports a factory power limit")
+
+    results = _apply_power(planned)
+    with STATE_LOCK:
+        for entry in results:
+            state["power_limits"].pop(entry["index"], None)
+        save_state()
+    refused = [entry["index"] for entry in results if entry.get("ok") is False]
+    record_action("power limits back to factory ("
+                  + ", ".join(f"GPU {card['index']} = {watts} W" for card, watts, _ in planned) + ")")
+    return {"ok": not refused, "cards": results, "skipped": skipped}
+
+
+@app.post("/api/reset")
+def reset_settings(_: str = Depends(require_auth)):
+    """Back to the panel's own defaults: timers, auto-switch, no saved limits.
+
+    The cards are left where they are: this forgets the panel's memory, it does
+    not drive the hardware.
+    """
+    global last_busy
+    with STATE_LOCK:
+        state.clear()
+        state.update(copy.deepcopy(DEFAULTS))
+        save_state()
+    last_busy = time.time()
+    record_action("settings reset to defaults")
+    return auto_snapshot()
 
 
 @app.post("/api/llama/unload")

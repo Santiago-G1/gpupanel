@@ -189,6 +189,64 @@ def test_power_limit_is_bounded_by_the_card(panel):
     assert panel.set_power({"watts": 250}, "t")["ok"] is True
 
 
+def test_factory_puts_every_card_on_its_own_default(panel):
+    stub_gpu(panel, card(index="0", power_default="250.00", power_limit="175.00"),
+             card(index="1", uuid="GPU-bbbb", power_default="250.00", power_limit="150.00"))
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+    panel.state["power_limits"] = {"0": 175, "1": 150}
+
+    out = panel.power_factory("t")
+
+    assert calls == ["nvidia-smi -i 0 -pl 250", "nvidia-smi -i 1 -pl 250"]
+    assert out["ok"] is True
+    # Forgotten, or the next start would put the old limits back.
+    assert panel.state["power_limits"] == {}
+
+
+def test_a_card_without_a_factory_limit_is_skipped(panel):
+    stub_gpu(panel, card(index="0", power_default="250.00"),
+             card(index="1", uuid="GPU-bbbb", power_default="N/A"))
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+
+    out = panel.power_factory("t")
+
+    assert calls == ["nvidia-smi -i 0 -pl 250"]
+    assert out["skipped"] == ["1"]
+
+
+def test_factory_refuses_when_no_card_reports_a_default(panel):
+    stub_gpu(panel, card(index="0", power_default="N/A"))
+    panel.ssh = lambda host, command, timeout=30: Proc()
+
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.power_factory("t")
+    assert exc.value.status_code == 400
+
+
+def test_reset_returns_every_setting_to_its_default(panel):
+    panel.state["llama_idle_min"] = 5
+    panel.state["enabled"] = False
+    panel.state["power_limits"] = {"0": 150}
+
+    out = panel.reset_settings("t")
+
+    assert out["llama_idle_min"] == panel.DEFAULTS["llama_idle_min"]
+    assert out["enabled"] == panel.DEFAULTS["enabled"]
+    assert panel.state["power_limits"] == {}
+
+
+def test_reset_leaves_the_defaults_themselves_untouched(panel):
+    panel.reset_settings("t")
+    panel.state["power_limits"]["0"] = 150
+    panel.state["gpus_names"]["0"] = "changed"
+
+    # A shallow copy of DEFAULTS would let a later write poison the defaults.
+    assert panel.DEFAULTS["power_limits"] == {}
+    assert panel.DEFAULTS["gpus_names"] == {}
+
+
 def test_a_limit_that_was_applied_is_remembered(panel):
     stub_gpu(panel, card(index="0"), card(index="1", uuid="GPU-bbbb"))
     panel.ssh = lambda host, command, timeout=30: Proc()
