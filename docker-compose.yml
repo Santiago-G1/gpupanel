@@ -52,8 +52,9 @@ services:
     volumes:
       # The key that reaches the hosts this panel drives.
       - /root/.ssh:/root/.ssh:ro
-      # Auto-switch settings survive a recreate.
-      - gpu_panel_state:/state
+      # Settings survive a recreate, as a plain file under ./state: visible,
+      # backupable, and not deleted by `docker compose down -v`.
+      - ./state:/state
     deploy:
       resources:
         limits:
@@ -67,6 +68,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-
-volumes:
-  gpu_panel_state:
