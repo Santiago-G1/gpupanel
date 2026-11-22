@@ -189,6 +189,87 @@ def test_power_limit_is_bounded_by_the_card(panel):
     assert panel.set_power({"watts": 250}, "t")["ok"] is True
 
 
+def test_the_dashboard_sends_the_index_as_a_number_and_it_is_accepted(panel):
+    # The UI builds its payload from the status JSON, where the index can arrive
+    # as a number. Keying the cards by string is what that costs otherwise.
+    stub_gpu(panel, card(index="0"))
+    panel.ssh = lambda host, command, timeout=30: Proc()
+
+    out = panel.set_power({"cards": [{"index": 0, "watts": 150}]}, "t")
+
+    assert out["ok"] is True
+
+
+def test_reset_forgets_the_limits_it_was_asked_to_forget(panel):
+    stub_gpu(panel, card(index="0"))
+    panel.ssh = lambda host, command, timeout=30: Proc()
+
+    panel.set_power({"cards": [{"index": "0", "watts": 150}]}, "t")
+    assert panel.state["power_limits"]
+
+    panel.reset_settings("t")
+
+    assert panel.state["power_limits"] == {}
+
+
+def test_setting_a_limit_does_not_poison_the_defaults(panel):
+    # A shallow copy of DEFAULTS would put the value in the defaults themselves,
+    # and the reset button would bring it back.
+    stub_gpu(panel, card(index="0"))
+    panel.ssh = lambda host, command, timeout=30: Proc()
+
+    panel.set_power({"cards": [{"index": "0", "watts": 150}]}, "t")
+
+    assert panel.DEFAULTS["power_limits"] == {}
+
+
+def test_a_factory_limit_the_card_refuses_is_named_and_not_forgotten(panel):
+    stub_gpu(panel, card(index="0", power_default="250.00", power_limit="175.00"),
+             card(index="1", uuid="GPU-bbbb", power_default="250.00", power_limit="175.00"))
+    def fake_ssh(host, command, timeout=30):
+        if "-i 1" in command:
+            return Proc(returncode=1, stderr="not supported")
+        return Proc()
+    panel.ssh = fake_ssh
+    panel.state["power_limits"] = {"uuid:GPU-bbbb": 175}
+
+    panel.power_factory("t")
+
+    assert "GPU 0 = 250 W" in panel.state["last_action"]
+    assert "refused: 1" in panel.state["last_action"]
+    # The card that said no keeps what the operator asked for.
+    assert panel.state["power_limits"] == {"uuid:GPU-bbbb": 175}
+
+
+def test_a_corrupt_saved_limit_is_skipped_not_fatal(panel):
+    stub_gpu(panel, card(index="0", power_limit="175.00"))
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+    panel.state["power_limits"] = {"index:0": "lots", "index:1": 150}
+
+    panel.restore_power_limits(attempts=1, delay=0)
+
+    assert calls == []
+
+
+def test_comfyui_is_not_stopped_when_its_queue_cannot_be_read(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, COMFY_CONTAINER="comfyui", COMFY_URL="http://comfy.test")
+    monkeypatch.setattr(panel.httpx, "get", lambda *a, **k: (_ for _ in ()).throw(OSError("timeout")))
+    calls = []
+    monkeypatch.setattr(panel, "comfy", lambda action: calls.append(action) or {"ok": True})
+
+    assert panel.comfy_queue_depth() is None
+    assert panel.comfy_release() is False
+    assert calls == []
+
+
+def test_immich_is_not_stopped_when_the_queues_cannot_be_read(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, IMMICH_HOST="root@immich.test")
+    monkeypatch.setattr(panel, "ssh_script", lambda host, script, **kw: Proc(returncode=1, stderr="no route"))
+
+    assert panel.immich_ml_queue_active() is None
+
+
 def test_factory_puts_every_card_on_its_own_default(panel):
     stub_gpu(panel, card(index="0", power_default="250.00", power_limit="175.00"),
              card(index="1", uuid="GPU-bbbb", power_default="250.00", power_limit="150.00"))

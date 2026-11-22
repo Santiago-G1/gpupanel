@@ -293,7 +293,9 @@ log = logging.getLogger("gpu-panel")
 # Derived from the credentials: rotating either one logs every browser out.
 SESSION_KEY = hashlib.sha256(f"session|{PANEL_PASSWORD}|{PANEL_TOKEN}".encode()).digest()
 
-state = dict(DEFAULTS)
+# deepcopy, not dict(): DEFAULTS holds dicts and lists, and a shallow copy
+# would let set_power() poison the defaults the reset button restores.
+state = copy.deepcopy(DEFAULTS)
 # Reentrant: record_action() takes it and then saves, which takes it again.
 STATE_LOCK = threading.RLock()
 # The consumer probes are independent SSH/HTTP round trips; run them at once.
@@ -334,6 +336,8 @@ def load_state():
     global last_busy
     with STATE_LOCK:
         state.update({k: v for k, v in stored.items() if k in DEFAULTS})
+        if not isinstance(state.get("power_limits"), dict):
+            state["power_limits"] = {}
     if state.get("last_busy"):
         # A restart is not an idle period: keep counting from before it.
         last_busy = float(state["last_busy"])
@@ -965,13 +969,18 @@ def comfy_queue_depth():
     try:
         queue = httpx.get(f"{COMFY_URL}/queue", timeout=6).json()
         return len(queue.get("queue_running") or []) + len(queue.get("queue_pending") or [])
-    except Exception:  # noqa: BLE001 - starting container has no API yet
-        return 0
+    except Exception:  # noqa: BLE001 - a starting container has no API yet
+        # Unknown, not empty: stopping on this would kill prompts in flight.
+        return None
 
 
 def comfy_release(why=None):
     """Stop ComfyUI (only when idle) and hand the card back."""
-    if comfy_queue_depth():
+    depth = comfy_queue_depth()
+    if depth is None:
+        log.warning("ComfyUI: could not read its queue, leaving it alone")
+        return False
+    if depth:
         return False
     with contextlib.suppress(HTTPException):
         comfy("stop")
@@ -1021,11 +1030,17 @@ def immich_ml_queue_active():
         for q in IMMICH_ML_QUEUES
     )
     p = ssh_script(IMMICH_HOST, script)
-    total = 0
+    if p.returncode != 0:
+        log.warning("Immich: could not read the ML queues, leaving it alone: %s",
+                    (p.stderr or "").strip()[:120])
+        return None
+    total, seen = 0, False
     for line in p.stdout.split():
         if line.isdigit():
             total += int(line)
-    return total
+            seen = True
+    # No number at all is a failed read, not an idle queue.
+    return total if seen else None
 
 
 def immich_transcode():
@@ -1749,7 +1764,7 @@ def _apply_power(planned):
         raise HTTPException(400, "no card on this host exposes a settable power limit")
 
     results = []
-    for card, watts, command in settable:
+    for card, _watts, command in settable:
         p = ssh(GPU_HOST, command)
         entry = {"index": card.get("index"), "ok": p.returncode == 0}
         if p.returncode != 0:
@@ -1788,7 +1803,13 @@ def restore_power_limits(attempts=6, delay=10):
         by_uuid = {card.get("uuid"): card for card in cards if card.get("uuid")}
         by_index = {card.get("index"): card for card in cards}
         applied, refused, shared = [], [], {}
-        for key, watts in saved.items():
+        for key, raw_watts in saved.items():
+            watts = as_number(raw_watts, None)
+            if watts is None:
+                log.warning("power limits: %s holds %r, not a number", key, raw_watts)
+                continue
+            # The tools take whole watts; a stored 150.0 must not become "150.0".
+            watts = int(watts)
             card = card_for_key(key, by_uuid, by_index)
             if card is None:
                 log.warning("power limits: nothing on this host matches %s", key)
@@ -1825,7 +1846,7 @@ def restore_power_limits(attempts=6, delay=10):
             log.info("power limits restored: %s", ", ".join(applied))
             record_action("power limits restored: " + ", ".join(applied))
         if refused:
-            record_action("power limits: %d card(s) refused the saved value" % len(refused))
+            record_action(f"power limits: {len(refused)} card(s) refused the saved value")
         return
 
 
@@ -1865,13 +1886,13 @@ def set_power(body: dict = Body(...), _: str = Depends(require_auth)):
     else:
         if not isinstance(advanced, list) or not advanced:
             raise HTTPException(400, "cards must be a non-empty list")
-        by_index = {card.get("index"): card for card in cards}
+        by_index = {str(card.get("index")): card for card in cards}
         planned = []
         for entry in advanced:
             if not isinstance(entry, dict):
                 raise HTTPException(400, "every entry of cards must be an object")
             index = entry.get("index")
-            card = by_index.get(index)
+            card = by_index.get(str(index))
             if card is None:
                 raise HTTPException(400, f"this host has no card {index!r}")
             if card.get("power_per_card") is False:
@@ -1899,6 +1920,8 @@ def set_power(body: dict = Body(...), _: str = Depends(require_auth)):
             took[limit_key(card)] = watts
     if took:
         with STATE_LOCK:
+            if not isinstance(state.get("power_limits"), dict):
+                state["power_limits"] = {}
             for card, _, command in planned:
                 if command:
                     # The old files were keyed by index; drop those entries so a
@@ -1951,14 +1974,29 @@ def power_factory(_: str = Depends(require_auth)):
         raise HTTPException(400, "no card on this host reports a factory power limit")
 
     results = _apply_power(planned)
+    moved = {card.get("index") for card, _, _ in planned
+             if any(entry.get("index") == card.get("index") and entry.get("ok") for entry in results)}
     with STATE_LOCK:
-        # Whatever the keys were (an older file used the index), nothing is kept.
-        state["power_limits"] = {}
+        limits = state.get("power_limits")
+        if not isinstance(limits, dict):
+            limits = state["power_limits"] = {}
+        for card, _, _ in planned:
+            if card.get("index") not in moved:
+                continue
+            # A card that refused keeps its saved value: the operator asked for
+            # it and the next start is allowed to try again.
+            limits.pop(limit_key(card), None)
+            limits.pop(str(card.get("index")), None)
+            limits.pop(f"index:{card.get('index')}", None)
         save_state()
-    refused = [entry["index"] for entry in results if entry.get("ok") is False]
-    record_action("power limits back to factory ("
-                  + ", ".join(f"GPU {card['index']} = {watts} W" for card, watts, _ in planned) + ")")
-    return {"ok": not refused, "cards": results, "skipped": skipped}
+    rejected = [entry["index"] for entry in results if entry.get("ok") is False]
+    summary = "power limits back to factory (" + (
+        ", ".join(f"GPU {card['index']} = {watts} W" for card, watts, _ in planned
+                  if card.get("index") in moved) or "none accepted") + ")"
+    if rejected:
+        summary += f"; refused: {', '.join(str(i) for i in rejected)}"
+    record_action(summary)
+    return {"ok": not rejected, "cards": results, "skipped": skipped}
 
 
 @app.post("/api/reset")

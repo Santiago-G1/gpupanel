@@ -245,6 +245,17 @@ async function api(path, opts) {
   return r.headers.get('content-type')?.includes('json') ? r.json() : r.text();
 }
 
+// A 200 does not mean everything worked: /api/mode answers with a per-consumer
+// result, and a consumer that failed carries `.error`. Claiming success there
+// tells the operator the card is free while it is not.
+function partialErrors(out) {
+  if (!out || typeof out !== 'object' || Array.isArray(out)) return [];
+  return Object.keys(out).filter((k) => {
+    const v = out[k];
+    return v && typeof v === 'object' && !Array.isArray(v) && v.error;
+  });
+}
+
 // Spinner + pending toast, group locked, then the state re-derived from
 // /api/status and a confirmation toast.
 async function act(btn, path, body, opts = {}) {
@@ -255,7 +266,13 @@ async function act(btn, path, body, opts = {}) {
   toast(opts.pending || 'Applying…', 'busy', true);
   let ok = true;
   try {
-    return await api(path, {method: 'POST', body: body ? JSON.stringify(body) : undefined});
+    const out = await api(path, {method: 'POST', body: body ? JSON.stringify(body) : undefined});
+    const partial = partialErrors(out);
+    if (partial.length) {
+      ok = false;
+      msg('Applied only in part: ' + partial.join(', ') + ' did not follow', true);
+    }
+    return out;
   } catch (e) {
     ok = false;
     toast('Error: ' + e.message, 'err');
@@ -616,13 +633,18 @@ async function refresh() {
   $('pl-val').textContent = pl.value + ' W';
   const procs = gpus.flatMap((x) => (x.processes || []).map((p) => ({...p, gpu: x.index})));
   $('procs').innerHTML = procs.length
-    ? procs.map(p => `<tr><td class="mono">${p.gpu}</td><td>${p.pid}</td><td class="mono">${p.name}</td><td>${p.mem_mib} MiB</td></tr>`).join('')
+    ? procs.map(p => `<tr><td class="mono">${esc(p.gpu)}</td><td>${esc(p.pid)}</td><td class="mono">${esc(p.name)}</td><td>${esc(p.mem_mib)} MiB</td></tr>`).join('')
     : '<tr><td colspan="4" class="k">—</td></tr>';
 
   autoState = s.auto || {};
-  $('llm-idle').value = autoState.llama_idle_min;
-  $('ml-idle').value = autoState.ml_idle_min;
-  $('comfy-idle').value = autoState.comfy_idle_min ?? 0;
+  // A refresh every few seconds must not eat what is being typed.
+  const fill = (id, value) => {
+    const el = $(id);
+    if (document.activeElement !== el) el.value = value ?? '';
+  };
+  fill('llm-idle', autoState.llama_idle_min);
+  fill('ml-idle', autoState.ml_idle_min);
+  fill('comfy-idle', autoState.comfy_idle_min ?? 0);
   $('idle-s').textContent = human(autoState.idle_seconds || 0);
   $('last-action').textContent =
     autoState.last_action ? `${autoState.last_action} (${autoState.last_action_at})` : '—';
@@ -710,7 +732,11 @@ $('pl').addEventListener('input', (e) => {
 
 $('pl-apply').onclick = async () => {
   const watts = Number($('pl').value);
-  if (last && last.gpu && Number(last.gpu.power_limit) === watts) return skip('The limit is already ' + watts + ' W');
+  // The same test syncPower() uses: every settable card, not the first one.
+  const current = settableCards();
+  if (current.length && current.every((x) => Number(x.power_limit) === watts)) {
+    return skip('The limit is already ' + watts + ' W');
+  }
   const r = await act($('pl-apply'), '/api/power', {watts},
     {pending: 'Applying ' + watts + ' W…', done: 'Power limit = ' + watts + ' W'});
   // 200 means "at least one card took it": say which ones did not.
@@ -781,9 +807,21 @@ $('auto-toggle').onclick = () => act($('auto-toggle'), '/api/auto', {enabled: !a
    done: autoState.enabled ? 'Auto-switch off' : 'Auto-switch on'});
 
 $('auto-save').onclick = () => {
-  const llama = Number($('llm-idle').value), ml = Number($('ml-idle').value);
-  const comfy = Number($('comfy-idle').value);
-  act($('auto-save'), '/api/auto', {llama_idle_min: llama, ml_idle_min: ml, comfy_idle_min: comfy},
+  const read = (id, label) => {
+    const raw = $(id).value.trim();
+    const n = Number(raw);
+    // Number('') is 0 and 0 means "never release": refuse instead of guessing.
+    if (raw === '' || !Number.isInteger(n) || n < 0 || n > 1440) {
+      msg(label + ' must be a whole number of minutes between 0 and 1440', true);
+      return null;
+    }
+    return n;
+  };
+  const llama = read('llm-idle', 'The LLM threshold');
+  const ml = read('ml-idle', 'The Immich ML threshold');
+  const comfy = read('comfy-idle', 'The ComfyUI threshold');
+  if (llama === null || ml === null || comfy === null) return null;
+  return act($('auto-save'), '/api/auto', {llama_idle_min: llama, ml_idle_min: ml, comfy_idle_min: comfy},
       {group: '#auto', pending: 'Saving thresholds…',
        done: `Thresholds saved (LLM ${llama} min, ML ${ml} min, ComfyUI ${comfy} min)`});
 };
