@@ -393,12 +393,14 @@ function syncPower() {
 // inside it, so a refresh during a drag does not rewrite the slider.
 function renderAdvanced() {
   const box = $('pl-cards');
-  const cards = settableCards();
-  if (!cards.length) {
-    box.innerHTML = '<div class="k">No card on this host reports a settable range.</div>';
-    return;
-  }
-  box.innerHTML = cards.map((x) => {
+  // A vendor whose tool takes one value for the whole machine cannot be given a
+  // per-card control: that would move cards the operator never touched.
+  const cards = settableCards().filter((x) => x.power_per_card !== false);
+  const shared = settableCards().filter((x) => x.power_per_card === false);
+  let html = cards.length
+    ? ''
+    : '<div class="k">No card on this host can take a limit of its own.</div>';
+  html += cards.map((x) => {
     const low = num(x.power_min);
     const high = num(x.power_max);
     const now = num(x.power_limit);
@@ -412,6 +414,12 @@ function renderAdvanced() {
       <button class="pl-card-apply" data-index="${index}">Apply</button>
     </div>`;
   }).join('');
+  if (shared.length) {
+    html += '<div class="k" style="margin-top:8px">GPU '
+      + shared.map((x) => esc(x.index)).join(', ')
+      + ": this vendor's tool applies one limit to every card, so it stays on the slider above.</div>";
+  }
+  box.innerHTML = html;
 
   box.querySelectorAll('input.pl-card').forEach((input) => {
     input.oninput = () => {

@@ -247,13 +247,65 @@ def test_reset_leaves_the_defaults_themselves_untouched(panel):
     assert panel.DEFAULTS["gpus_names"] == {}
 
 
+def test_an_older_state_keyed_by_index_still_applies(panel):
+    # Files written before the uuid change carry the slot as the key.
+    stub_gpu(panel, card(index="0", power_limit="175.00"))
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+    panel.state["power_limits"] = {"0": 150}
+
+    panel.restore_power_limits(attempts=1, delay=0)
+
+    assert calls == ["nvidia-smi -i 0 -pl 150"]
+
+
+def test_a_limit_follows_the_card_when_the_slots_are_renumbered(panel):
+    # The saved key is the uuid: the same card now enumerates as index 1.
+    stub_gpu(panel, card(index="1", uuid="GPU-aaaa", power_limit="175.00"))
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+    panel.state["power_limits"] = {"uuid:GPU-aaaa": 150}
+
+    panel.restore_power_limits(attempts=1, delay=0)
+
+    assert calls == ["nvidia-smi -i 1 -pl 150"]
+
+
+def test_a_tool_with_one_value_for_the_whole_machine_is_not_offered_per_card(panel):
+    stub_gpu(panel, card(index="0", vendor="amd", setter="rocm-smi",
+                         power_min="150", power_max="300", power_per_card=False))
+    panel.ssh = lambda host, command, timeout=30: Proc()
+
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.set_power({"cards": [{"index": "0", "watts": 200}]}, "t")
+    assert exc.value.status_code == 400
+    assert "one limit for every card" in exc.value.detail
+    # The single-slider path still works: it is one value anyway.
+    assert panel.set_power({"watts": 200}, "t")["ok"] is True
+
+
+def test_restoring_a_machine_wide_limit_runs_it_once(panel):
+    stub_gpu(panel, card(index="0", vendor="amd", setter="rocm-smi", power_limit="250",
+                         power_min="150", power_max="300", power_per_card=False),
+             card(index="1", uuid="GPU-bbbb", vendor="amd", setter="rocm-smi", power_limit="250",
+                  power_min="150", power_max="300", power_per_card=False))
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+    panel.state["power_limits"] = {"index:0": 200, "index:1": 200}
+
+    panel.restore_power_limits(attempts=1, delay=0)
+
+    assert calls == ["rocm-smi --setpoweroverdrive 200"]
+
+
 def test_a_limit_that_was_applied_is_remembered(panel):
     stub_gpu(panel, card(index="0"), card(index="1", uuid="GPU-bbbb"))
     panel.ssh = lambda host, command, timeout=30: Proc()
 
     panel.set_power({"cards": [{"index": "1", "watts": 160}]}, "t")
 
-    assert panel.state["power_limits"] == {"1": 160}
+    # Filed under the card, not the slot it happens to occupy.
+    assert panel.state["power_limits"] == {"uuid:GPU-bbbb": 160}
 
 
 def test_a_refused_limit_is_not_remembered(panel):

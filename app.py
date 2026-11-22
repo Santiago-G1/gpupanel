@@ -217,7 +217,7 @@ for dev in /sys/class/drm/card[0-9]*/device; do
     nm=$(lspci -s "$bdf" 2>/dev/null | head -1 | sed -e 's/^[^ ]* //' -e 's/^[^:]*: //')
   fi
   hw=$(ls -d "$dev"/hwmon/hwmon* 2>/dev/null | head -1)
-  echo "card$(kv bdf "$bdf")$(kv drm "$drm")$(kv vendor "$(p "$dev/vendor")")$(kv driver "$drv")$(kv name "$nm")$(kv vram_used "$(p "$dev/mem_info_vram_used")")$(kv vram_total "$(p "$dev/mem_info_vram_total")")$(kv busy "$(p "$dev/gpu_busy_percent")")$(kv temp "$(p "$hw/temp1_input")")$(kv power "$(p "$hw/power1_average")")$(kv cap "$(p "$hw/power1_cap")")$(kv cap_min "$(p "$hw/power1_cap_min")")$(kv cap_max "$(p "$hw/power1_cap_max")")$(kv clk "$(p "$hw/freq1_input")")$(kv clk_mem "$(p "$hw/freq2_input")")$(kv link_speed "$(p "$dev/current_link_speed")")$(kv link_width "$(p "$dev/current_link_width")")$(kv unique_id "$(p "$dev/unique_id")")$(kv aer_fatal "$(aer "$dev/aer_dev_fatal" TOTAL_ERR_FATAL)")$(kv aer_nonfatal "$(aer "$dev/aer_dev_nonfatal" TOTAL_ERR_NONFATAL)")$(kv aer_correctable "$(aer "$dev/aer_dev_correctable" TOTAL_ERR_COR)")"
+  echo "card$(kv bdf "$bdf")$(kv drm "$drm")$(kv vendor "$(p "$dev/vendor")")$(kv driver "$drv")$(kv name "$nm")$(kv vram_used "$(p "$dev/mem_info_vram_used")")$(kv vram_total "$(p "$dev/mem_info_vram_total")")$(kv busy "$(p "$dev/gpu_busy_percent")")$(kv temp "$(p "$hw/temp1_input")")$(kv power "$(p "$hw/power1_average")")$(kv cap "$(p "$hw/power1_cap")")$(kv cap_default "$(p "$hw/power1_cap_default")")$(kv cap_min "$(p "$hw/power1_cap_min")")$(kv cap_max "$(p "$hw/power1_cap_max")")$(kv clk "$(p "$hw/freq1_input")")$(kv clk_mem "$(p "$hw/freq2_input")")$(kv link_speed "$(p "$dev/current_link_speed")")$(kv link_width "$(p "$dev/current_link_width")")$(kv unique_id "$(p "$dev/unique_id")")$(kv aer_fatal "$(aer "$dev/aer_dev_fatal" TOTAL_ERR_FATAL)")$(kv aer_nonfatal "$(aer "$dev/aer_dev_nonfatal" TOTAL_ERR_NONFATAL)")$(kv aer_correctable "$(aer "$dev/aer_dev_correctable" TOTAL_ERR_COR)")"
 done
 
 echo "@@nvinfo"
@@ -588,7 +588,7 @@ def sysfs_card(raw, vendor, tools):
         "temp": _tidy(raw.get("temp"), 1000),
         "power_draw": _tidy(raw.get("power"), 10**6),
         "power_limit": _tidy(raw.get("cap"), 10**6, 2),
-        "power_default": "N/A",
+        "power_default": _tidy(raw.get("cap_default"), 10**6, 2),
         "power_min": _tidy(raw.get("cap_min"), 10**6),
         "power_max": _tidy(raw.get("cap_max"), 10**6),
         "clk_sm": _tidy(raw.get("clk"), 10**6),
@@ -599,6 +599,9 @@ def sysfs_card(raw, vendor, tools):
         "bus_visible": True,
         "driver_visible": bool(raw.get("driver")),
         "power_settable": bool(setter),
+        # `amd-smi set -g` takes one card; `rocm-smi --setpoweroverdrive` is one
+        # value for the whole machine, so per-card is a promise it cannot keep.
+        "power_per_card": setter == "amd-smi",
         "setter": setter,
         "aer": _aer(raw),
     }
@@ -638,6 +641,7 @@ def build_cards(sections):
         card["bus_visible"] = (card["pci"] in bus) if card["pci"] else None
         card["driver_visible"] = True
         card["setter"] = "nvidia-smi" if tools.get("nvidia-smi", True) else None
+        card["power_per_card"] = True
         card["power_settable"] = (
             as_number(card.get("power_min"), None) is not None
             and as_number(card.get("power_max"), None) is not None
@@ -1716,6 +1720,27 @@ def set_auto(body: dict = Body(...), _: str = Depends(require_auth)):
     return auto_snapshot()
 
 
+def limit_key(card):
+    """What a saved limit is filed under: the card, not the slot it sits in.
+
+    `index` is the driver's enumeration order, and it moves when a card is added,
+    pulled or re-initialised. The uuid is the same string `nvidia-smi` calls
+    identity and `amdgpu` calls `unique_id`; the PCI address stands in for a card
+    that reports neither.
+    """
+    uuid = card.get("uuid")
+    return f"uuid:{uuid}" if uuid else f"index:{card.get('index')}"
+
+
+def card_for_key(key, by_uuid, by_index):
+    """The card a saved limit belongs to, including state files keyed by index."""
+    if key.startswith("uuid:"):
+        return by_uuid.get(key[5:])
+    if key.startswith("index:"):
+        return by_index.get(key[6:])
+    return by_index.get(key)
+
+
 def _apply_power(planned):
     """Run one command per card. Returns the per-card answer, refusals included."""
     settable = [(card, watts, command) for card, watts, command in planned if command]
@@ -1760,29 +1785,41 @@ def restore_power_limits(attempts=6, delay=10):
             time.sleep(delay)
             continue
 
+        by_uuid = {card.get("uuid"): card for card in cards if card.get("uuid")}
         by_index = {card.get("index"): card for card in cards}
-        applied, refused = [], []
-        for index, watts in saved.items():
-            card = by_index.get(index)
+        applied, refused, shared = [], [], {}
+        for key, watts in saved.items():
+            card = card_for_key(key, by_uuid, by_index)
             if card is None:
-                log.warning("power limits: this host has no card %r", index)
+                log.warning("power limits: nothing on this host matches %s", key)
                 continue
             low = as_number(card.get("power_min"), None)
             high = as_number(card.get("power_max"), None)
             if low is not None and high is not None and not low <= watts <= high:
-                log.warning("power limits: GPU %s cannot take %s W (%s-%s)", index, watts, low, high)
-                continue
-            if as_number(card.get("power_limit"), None) == watts:
+                log.warning("power limits: %s cannot take %s W (%s-%s)", key, watts, low, high)
                 continue
             command = power_command(card, watts)
             if not command:
                 continue
+            if card.get("power_per_card") is False:
+                # One value for every card that vendor owns: two saved values for
+                # the same tool cannot both be honoured, so the first one wins.
+                setter = card.get("setter")
+                if setter in shared:
+                    if shared[setter] != watts:
+                        log.warning("power limits: %s is one value for every card, "
+                                    "keeping %s W", setter, shared[setter])
+                    continue
+                shared[setter] = watts
+            if as_number(card.get("power_limit"), None) == watts:
+                continue
+
             p = ssh(GPU_HOST, command)
             if p.returncode == 0:
-                applied.append(f"GPU {index} = {watts} W")
+                applied.append(f"GPU {card.get('index')} = {watts} W")
             else:
-                refused.append(f"GPU {index}")
-                log.warning("power limits: GPU %s refused %s W: %s", index, watts,
+                refused.append(f"GPU {card.get('index')}")
+                log.warning("power limits: GPU %s refused %s W: %s", card.get("index"), watts,
                             (p.stderr or p.stdout or "").strip()[:120])
         if applied:
             log.info("power limits restored: %s", ", ".join(applied))
@@ -1837,6 +1874,11 @@ def set_power(body: dict = Body(...), _: str = Depends(require_auth)):
             card = by_index.get(index)
             if card is None:
                 raise HTTPException(400, f"this host has no card {index!r}")
+            if card.get("power_per_card") is False:
+                # One value, every card of that vendor: pretend otherwise and the
+                # operator sets GPU 1 and silently moves GPU 0 too.
+                raise HTTPException(400, f"GPU {index}: this vendor's tool sets one limit "
+                                         "for every card, not one per card")
             try:
                 watts = int(entry.get("watts"))
             except (TypeError, ValueError):
@@ -1849,10 +1891,22 @@ def set_power(body: dict = Body(...), _: str = Depends(require_auth)):
 
     asked = {card.get("index"): watts for card, watts, command in planned if command}
     results = _apply_power(planned)
-    took = {entry["index"]: asked[entry["index"]] for entry in results if entry.get("ok")}
+    took = {}
+    for card, watts, command in planned:
+        if not command:
+            continue
+        if any(entry.get("index") == card.get("index") and entry.get("ok") for entry in results):
+            took[limit_key(card)] = watts
     if took:
         with STATE_LOCK:
+            for card, _, command in planned:
+                if command:
+                    # The old files were keyed by index; drop those entries so a
+                    # card does not end up with two saved values.
+                    state["power_limits"].pop(str(card.get("index")), None)
+                    state["power_limits"].pop(f"index:{card.get('index')}", None)
             state["power_limits"].update(took)
+
     refused = [entry["index"] for entry in results if entry.get("ok") is False]
     if advanced is None:
         summary = f"power limit = {asked[results[0]['index']]} W"
@@ -1879,20 +1933,27 @@ def power_factory(_: str = Depends(require_auth)):
     same breath, so the next start does not undo it.
     """
     cards = gpu_status()["gpus"]
-    planned, skipped = [], []
+    planned, skipped, shared = [], [], set()
     for card in cards:
         watts = as_number(card.get("power_default"), None)
-        if watts is None or not power_command(card, watts):
+        command = power_command(card, watts) if watts is not None else None
+        if watts is None or not command:
             skipped.append(card.get("index"))
             continue
+        if card.get("power_per_card") is False:
+            setter = card.get("setter")
+            if setter in shared:
+                skipped.append(card.get("index"))
+                continue
+            shared.add(setter)
         planned.append((card, int(watts), power_command(card, int(watts))))
     if not planned:
         raise HTTPException(400, "no card on this host reports a factory power limit")
 
     results = _apply_power(planned)
     with STATE_LOCK:
-        for entry in results:
-            state["power_limits"].pop(entry["index"], None)
+        # Whatever the keys were (an older file used the index), nothing is kept.
+        state["power_limits"] = {}
         save_state()
     refused = [entry["index"] for entry in results if entry.get("ok") is False]
     record_action("power limits back to factory ("

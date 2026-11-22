@@ -262,7 +262,14 @@ card's own range, which is what a machine with two different cards needs.
 The limits are kept in the panel's state and re-applied when it starts, waiting
 for a driver that is not up yet, so a reboot settles on the panel's values and
 not on the boot configuration's. A card that is gone, or that no longer accepts
-the saved value, is logged and skipped.
+the saved value, is logged and skipped. Each limit is filed under the card's
+uuid, not its index, so pulling a card or reloading the driver does not hand the
+value to a different one.
+
+It adapts to what the vendor actually exposes: `nvidia-smi -i` and `amd-smi -g`
+take one card, `rocm-smi --setpoweroverdrive` takes one value for the whole
+machine (and is refused per card rather than silently moving every card), and a
+vendor with no cap (Intel, vGPU) has no control at all.
 
 Two ways back. **Factory (250 W)** is the manufacturer's limit reported by the
 card itself: the number is on the button because it is not the lower cap a host
