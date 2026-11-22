@@ -283,6 +283,10 @@ DEFAULTS = {
 }
 
 
+# Uvicorn configures its own loggers and nothing configures this one, so
+# `log.info` would go nowhere: the boot-time limit restore has to be readable in
+# `docker logs` or nobody can tell it happened.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("gpu-panel")
 
 # Derived from the credentials: rotating either one logs every browser out.
