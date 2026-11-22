@@ -276,6 +276,8 @@ DEFAULTS = {
     "gpus_events": [],
     "gpus_down": {},
     "gpus_blind": [],
+    # Per card: the limit the panel last set, so a restart does not lose it.
+    "power_limits": {},
     "gpus_aer": {},
     "last_busy": None,
 }
@@ -298,6 +300,7 @@ llm_blocked = False
 async def lifespan(_app: FastAPI):
     """Load the saved settings and start the auto-switch tick."""
     load_state()
+    threading.Thread(target=restore_power_limits, name="restore-power", daemon=True).start()
     task = asyncio.create_task(auto_loop())
     try:
         yield
@@ -1732,6 +1735,58 @@ def _apply_power(planned):
     return results
 
 
+def restore_power_limits(attempts=6, delay=10):
+    """Re-apply the limits this panel last set, once the card host answers.
+
+    The panel starts after the machine, and `nvidia-smi` can be slow on a host
+    that has just booted, so a failed probe is retried instead of being taken as
+    "nothing to do". A card that is gone, or that no longer accepts the value,
+    is logged and skipped: the panel still has to serve.
+    """
+    saved = dict(state.get("power_limits") or {})
+    if not saved:
+        return
+
+    for attempt in range(attempts):
+        try:
+            cards = gpu_status()["gpus"]
+        except Exception as exc:  # noqa: BLE001 - the dashboard must come up anyway
+            log.warning("power limits: %s (attempt %d/%d)", exc, attempt + 1, attempts)
+            time.sleep(delay)
+            continue
+
+        by_index = {card.get("index"): card for card in cards}
+        applied, refused = [], []
+        for index, watts in saved.items():
+            card = by_index.get(index)
+            if card is None:
+                log.warning("power limits: this host has no card %r", index)
+                continue
+            low = as_number(card.get("power_min"), None)
+            high = as_number(card.get("power_max"), None)
+            if low is not None and high is not None and not low <= watts <= high:
+                log.warning("power limits: GPU %s cannot take %s W (%s-%s)", index, watts, low, high)
+                continue
+            if as_number(card.get("power_limit"), None) == watts:
+                continue
+            command = power_command(card, watts)
+            if not command:
+                continue
+            p = ssh(GPU_HOST, command)
+            if p.returncode == 0:
+                applied.append(f"GPU {index} = {watts} W")
+            else:
+                refused.append(f"GPU {index}")
+                log.warning("power limits: GPU %s refused %s W: %s", index, watts,
+                            (p.stderr or p.stdout or "").strip()[:120])
+        if applied:
+            log.info("power limits restored: %s", ", ".join(applied))
+            record_action("power limits restored: " + ", ".join(applied))
+        if refused:
+            record_action("power limits: %d card(s) refused the saved value" % len(refused))
+        return
+
+
 @app.post("/api/power")
 def set_power(body: dict = Body(...), _: str = Depends(require_auth)):
     """One limit for every card, or one limit for one card.
@@ -1789,6 +1844,10 @@ def set_power(body: dict = Body(...), _: str = Depends(require_auth)):
 
     asked = {card.get("index"): watts for card, watts, command in planned if command}
     results = _apply_power(planned)
+    took = {entry["index"]: asked[entry["index"]] for entry in results if entry.get("ok")}
+    if took:
+        with STATE_LOCK:
+            state["power_limits"].update(took)
     refused = [entry["index"] for entry in results if entry.get("ok") is False]
     if advanced is None:
         summary = f"power limit = {asked[results[0]['index']]} W"

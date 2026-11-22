@@ -189,6 +189,70 @@ def test_power_limit_is_bounded_by_the_card(panel):
     assert panel.set_power({"watts": 250}, "t")["ok"] is True
 
 
+def test_a_limit_that_was_applied_is_remembered(panel):
+    stub_gpu(panel, card(index="0"), card(index="1", uuid="GPU-bbbb"))
+    panel.ssh = lambda host, command, timeout=30: Proc()
+
+    panel.set_power({"cards": [{"index": "1", "watts": 160}]}, "t")
+
+    assert panel.state["power_limits"] == {"1": 160}
+
+
+def test_a_refused_limit_is_not_remembered(panel):
+    stub_gpu(panel, card(index="0"))
+    panel.ssh = lambda host, command, timeout=30: Proc(returncode=1, stderr="not supported")
+
+    with pytest.raises(panel.HTTPException):
+        panel.set_power({"cards": [{"index": "0", "watts": 160}]}, "t")
+
+    assert panel.state["power_limits"] == {}
+
+
+def test_the_saved_limits_are_reapplied_on_start(panel):
+    # The card comes up with the boot configuration's value, not the panel's.
+    stub_gpu(panel, card(index="0", power_limit="175.00"),
+             card(index="1", uuid="GPU-bbbb", power_limit="175.00"))
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+    panel.state["power_limits"] = {"0": 150, "1": 175}
+
+    panel.restore_power_limits(attempts=1, delay=0)
+
+    # Only the card whose value differs is written, and only with its own value.
+    assert calls == ["nvidia-smi -i 0 -pl 150"]
+
+
+def test_a_saved_limit_the_card_no_longer_takes_is_skipped(panel):
+    stub_gpu(panel, card(index="0", power_min="160", power_max="250"))
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+    panel.state["power_limits"] = {"0": 125, "7": 150}
+
+    panel.restore_power_limits(attempts=1, delay=0)
+
+    assert calls == []
+
+
+def test_the_restore_waits_for_a_driver_that_is_not_up_yet(panel):
+    attempts = []
+
+    def flaky():
+        attempts.append(1)
+        if len(attempts) < 2:
+            raise panel.HTTPException(503, "not ready")
+        return {"gpus": [card(index="0", power_limit="175.00")]}
+
+    panel.gpu_status = flaky
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+    panel.state["power_limits"] = {"0": 150}
+
+    panel.restore_power_limits(attempts=3, delay=0)
+
+    assert len(attempts) == 2
+    assert calls == ["nvidia-smi -i 0 -pl 150"]
+
+
 def test_each_card_can_take_its_own_limit(panel):
     stub_gpu(panel, card(index="0", power_min="100", power_max="250"),
              card(index="1", uuid="GPU-bbbb", power_min="150", power_max="300"))

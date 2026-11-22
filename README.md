@@ -255,9 +255,12 @@ a broken SSH hop is what the far side said. A timeout is one of those answers:
 
 The power control has two shapes for the same endpoint. The slider applies one
 value to every settable card; **Advanced** opens one control per card, with that
-card's own range, which is what a machine with two different cards needs. The
-limit lives in the driver and not in this panel, so the host's boot
-configuration writes its own value back on the next reboot or deploy.
+card's own range, which is what a machine with two different cards needs.
+
+The limits are kept in the panel's state and re-applied when it starts, waiting
+for a driver that is not up yet, so a reboot settles on the panel's values and
+not on the boot configuration's. A card that is gone, or that no longer accepts
+the saved value, is logged and skipped.
 
 `/api/status` is the document a widget or a script parses, so here it is,
 abridged and with the numbers shortened:
@@ -401,7 +404,8 @@ four probes do properly.
 ## State
 
 `/state/auto.json`, in the `gpu_panel_state` volume, holds what has to survive a
-recreate: the auto-switch settings, the last action and when it happened, the
+recreate: the auto-switch settings, the power limit of each card (re-applied on
+start), the last action and when it happened, the
 revoked session nonces (sessions are stateless, so a logout has to remember one),
 the Jellyfin device to restore and the card inventory (`gpus_known`, the names of
 cards that have since disappeared, and the last change). Losing it costs a re-login and the timers
