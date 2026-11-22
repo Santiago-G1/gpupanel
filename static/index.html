@@ -130,14 +130,11 @@
   <div class="card">
     <div class="k">Current hardware acceleration: <b id="jf-accel" class="mono">—</b></div>
     <div class="k" style="margin-top:6px">
-      NVENC uses the discrete card, VAAPI the integrated one.
+      The card's own accelerator while llama.cpp is off it; the fallback device
+      is where Jellyfin goes while llama.cpp has the card.
       <a href="/howto#jellyfin">Which one to pick →</a>
     </div>
-    <div class="row" id="jf" style="margin-top:10px">
-      <button class="on" data-accel="nvenc">NVIDIA NVENC · the card</button>
-      <button data-accel="vaapi">VAAPI · integrated GPU</button>
-      <button class="warn" data-accel="none">CPU (no acceleration)</button>
-    </div>
+    <div class="row" id="jf" style="margin-top:10px"></div>
   </div>
 
   <h2 id="logs">llama.cpp logs</h2>
@@ -175,15 +172,19 @@ document.title = location.hostname + ' · GPU Control';
 
 const MODES = {
   llm: 'LLM (the card is llama.cpp\'s)',
-  media: 'Media (Immich ML + Jellyfin NVENC)',
+  media: 'Media (Immich ML + Jellyfin on the card)',
   balanced: 'Shared (LLM + media on the card)',
   image: 'Image (ComfyUI on the card)',
-  igpu: 'Media with Jellyfin on the integrated GPU',
+  igpu: 'Media with Jellyfin on the fallback device',
   idle: 'Idle (nothing loaded)',
   mixed: 'mixed / transitioning',
 };
 
-const DEVICES = {nvenc: 'GPU (NVENC)', vaapi: 'integrated GPU (VAAPI)', none: 'CPU'};
+const DEVICES = {
+  none: 'CPU (no acceleration)', amf: 'AMD AMF', qsv: 'Intel QuickSync (QSV)',
+  nvenc: 'NVIDIA NVENC', v4l2m2m: 'V4L2 M2M', vaapi: 'VAAPI',
+  videotoolbox: 'VideoToolbox', rkmpp: 'Rockchip MPP',
+};
 const str = (v) => (typeof v === 'string' ? v : '');
 // nvidia-smi answers N/A for anything the card does not report.
 const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : null; };
@@ -322,6 +323,26 @@ function diskRows(models) {
   return rows + `<div class="k" style="font-size:12px">${models.length} on disk · ${served} served</div>`;
 }
 
+// One button per accelerator this Jellyfin build accepts, marked with the one
+// in use and with the fallback device named in its title.
+function renderJellyfinAccel(s) {
+  const box = $('jf');
+  if (!box) return;
+  const cfg = s.configured || {};
+  const choices = Array.isArray(cfg.jellyfin_accel_types) ? cfg.jellyfin_accel_types : [];
+  if (!choices.length) {
+    box.innerHTML = '<span class="k">Jellyfin is not configured</span>';
+    return;
+  }
+  const current = str(s.jellyfin_accel);
+  const fallback = str(cfg.jellyfin_fallback);
+  box.innerHTML = choices.map((c) => {
+    const on = c.value === current ? ' class="on"' : (c.value === 'none' ? ' class="warn"' : '');
+    const title = c.value === fallback ? ' title="fallback: where Jellyfin goes while llama.cpp has the card"' : '';
+    return `<button${on} data-accel="${esc(c.value)}"${title}>${esc(c.label)}</button>`;
+  }).join('');
+}
+
 // State derived from what the probes report.
 function deriveMode(s) {
   // ComfyUI keeps the card while it is up, so it wins over every other reading.
@@ -335,7 +356,11 @@ function deriveMode(s) {
   // "LLM": the card belongs to llama.cpp; Immich ML (CUDA) is the only other
   // consumer that has to stop for it.
   if (ml === 'exited' || ml === 'created' || ml === 'paused') return 'llm';
-  if (ml === 'running') return jf === 'nvenc' ? (loaded ? 'balanced' : 'media') : 'igpu';
+  if (ml === 'running') {
+    const fallback = str((s.configured || {}).jellyfin_fallback) || 'vaapi';
+    const onCard = !!jf && jf !== fallback && jf !== 'none' && jf !== 'unknown' && jf !== 'unconfigured';
+    return onCard ? (loaded ? 'balanced' : 'media') : 'igpu';
+  }
   return 'mixed';
 }
 
@@ -357,6 +382,7 @@ function paintState(s) {
   now.className = 'pill ' + (mode === 'mixed' ? '' : 'acc');
 
   const jf = str(s.jellyfin_accel);
+  renderJellyfinAccel(s);
   pressed('#jf button', (d) => d.accel === jf);
 
   const ml = str(s.immich_ml);
@@ -650,7 +676,9 @@ async function refresh() {
     autoState.last_action ? `${autoState.last_action} (${autoState.last_action_at})` : '—';
   const jfDev = deviceLabel(str(s.jellyfin_accel));
   const moved = [];
-  if (s.configured?.immich) moved.push(autoState.llm_blocked ? 'Immich ML stopped' : 'Immich ML on the card');
+  // The consumer's own state, not the mode flag: after a stop that failed the
+  // flag is false and the line used to claim it had been stopped anyway.
+  if (s.configured?.immich) moved.push('Immich ML ' + (str(s.immich_ml) === 'running' ? 'running' : 'stopped'));
   if (s.configured?.jellyfin) moved.push(`Jellyfin on ${jfDev}`);
   $('llm-mode-state').textContent = moved.length
     ? `${autoState.llm_blocked ? 'LLM priority' : 'media active'}: ${moved.join(', ')}`
@@ -712,6 +740,8 @@ $('pl-factory').onclick = async () => {
     msg('GPU ' + bad.map((c) => c.index).join(', ') + ' refused the factory limit: '
         + (bad[0].error || 'the driver said no'), true);
   }
+  const none = (r && Array.isArray(r.skipped) ? r.skipped : []);
+  if (none.length) msg('GPU ' + none.join(', ') + ' reports no factory limit, left alone');
 };
 
 $('reset-settings').onclick = () => act($('reset-settings'), '/api/reset', null,
@@ -740,7 +770,7 @@ $('pl-apply').onclick = async () => {
   const r = await act($('pl-apply'), '/api/power', {watts},
     {pending: 'Applying ' + watts + ' W…', done: 'Power limit = ' + watts + ' W'});
   // 200 means "at least one card took it": say which ones did not.
-  const refused = (r && Array.isArray(r.cards) ? r.cards : []).filter((c) => !c.ok);
+  const refused = (r && Array.isArray(r.cards) ? r.cards : []).filter((c) => c.ok === false);
   if (refused.length) {
     msg(refused.length + ' card(s) refused ' + watts + ' W: ' + refused.map((c) => 'GPU ' + c.index).join(', ')
         + ' — ' + (refused[0].error || 'the driver said no'), true);
@@ -793,14 +823,16 @@ $('comfy-open').onclick = () => {
   if (url) window.open(url, '_blank', 'noopener');
 };
 
-document.querySelectorAll('#jf button').forEach((b) => {
-  b.onclick = () => {
-    const accel = b.dataset.accel;
-    if (last && last.jellyfin_accel === accel) return skip('Jellyfin already uses ' + accel + ' · ' + deviceLabel(accel));
-    pressed('#jf button', (d) => d.accel === accel);
-    act(b, '/api/jellyfin/accel/' + accel, null, {group: '#jf', pending: 'Jellyfin → ' + accel + ' (restarts the container)…', done: 'Jellyfin: ' + accel});
-  };
-});
+// Delegated: the buttons are re-drawn whenever the state changes, so binding
+// them one by one would stop working after the first refresh.
+$('jf').onclick = (e) => {
+  const b = e.target.closest('button[data-accel]');
+  if (!b) return;
+  const accel = b.dataset.accel;
+  if (last && last.jellyfin_accel === accel) return skip('Jellyfin already uses ' + accel + ' · ' + deviceLabel(accel));
+  pressed('#jf button', (d) => d.accel === accel);
+  act(b, '/api/jellyfin/accel/' + accel, null, {group: '#jf', pending: 'Jellyfin → ' + accel + ' (restarts the container)…', done: 'Jellyfin: ' + accel});
+};
 
 $('auto-toggle').onclick = () => act($('auto-toggle'), '/api/auto', {enabled: !autoState.enabled},
   {group: '#auto', pending: autoState.enabled ? 'Turning the auto-switch off…' : 'Turning the auto-switch on…',

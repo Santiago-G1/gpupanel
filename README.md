@@ -42,7 +42,7 @@ either an HTTP call or a command over SSH.
 | --- | --- | --- | --- |
 | llama.cpp | `LLAMA_URL` (HTTP) | a large model takes the whole card | unloads every resident model over the router API |
 | Immich ML | `IMMICH_HOST` (SSH) | CUDA: it cannot share the card | `docker stop` / `start` on `IMMICH_ML_CONTAINER` |
-| Jellyfin | `JELLYFIN_HOST` (SSH) | an NVENC session, small | rewrites `<HardwareAccelerationType>` to `vaapi` (integrated GPU) or back to `nvenc` |
+| Jellyfin | `JELLYFIN_HOST` (SSH) | a hardware transcode session, small | rewrites `<HardwareAccelerationType>` to the fallback device, or back to `JELLYFIN_ACCEL_GPU` |
 | ComfyUI | `AI_HOST` + `AI_CTID` | enough to matter, and it grows | `docker start` / `stop` on `COMFY_CONTAINER` |
 
 The panel reads every card the host reports and attributes the processes by
@@ -119,10 +119,10 @@ a consistent state and records the action in the state file.
 
 | Mode | llama.cpp | Immich ML | Jellyfin | ComfyUI |
 | --- | --- | --- | --- | --- |
-| `llm` | untouched | stopped | integrated GPU (VAAPI) | stopped |
-| `media` | unloaded | started | P100 (NVENC) | stopped |
-| `balanced` | untouched | started | P100 (NVENC) | stopped |
-| `image` | unloaded | stopped | integrated GPU (VAAPI) | started |
+| `llm` | untouched | stopped | the fallback device | stopped |
+| `media` | unloaded | started | the card's encoder | stopped |
+| `balanced` | untouched | started | the card's encoder | stopped |
+| `image` | unloaded | stopped | the fallback device | started |
 
 `balanced` is the only one that deliberately leaves the card oversubscribed: it
 is for a small LLM next to Immich's face detection, and it is the one that can
@@ -249,7 +249,7 @@ it usable from scripts.
 | `/api/llama/logs?lines=200` | GET | `journalctl` of the unit on `AI_HOST` (through `pct exec` when `AI_CTID` is set), capped at 2000 lines. |
 | `/api/comfy/{start,stop,restart}` | POST | The ComfyUI container on `AI_HOST`; skipped when `COMFY_CONTAINER` is empty. |
 | `/api/immich/ml/{start,stop,restart}` | POST | `IMMICH_ML_CONTAINER` on `IMMICH_HOST`; skipped when it is not configured. |
-| `/api/jellyfin/accel/{nvenc,vaapi,none}` | POST | Rewrite the config and restart `JELLYFIN_CONTAINER`; skipped when not configured. |
+| `/api/jellyfin/accel/{value}` | POST | Rewrite the config and restart `JELLYFIN_CONTAINER`; skipped when not configured. The value is one of Jellyfin's own: `none`, `amf`, `qsv`, `nvenc`, `v4l2m2m`, `vaapi`, `videotoolbox`, `rkmpp`. |
 
 Every `502` carries the failing command's own stderr, because the useful part of
 a broken SSH hop is what the far side said. A timeout is one of those answers:
@@ -370,7 +370,8 @@ them as models. The dashboard marks a row `●` loaded (which includes
 | `JELLYFIN_HOST` | empty | Empty = no Jellyfin. Needs `JELLYFIN_XML` too. |
 | `JELLYFIN_XML` | empty | Absolute path of `encoding.xml` on that host. |
 | `JELLYFIN_CONTAINER` | `jellyfin` | Restarted around the rewrite. |
-| `JELLYFIN_FALLBACK` | `vaapi` | Where Jellyfin goes while llama.cpp owns the card; `none` restores CPU. |
+| `JELLYFIN_FALLBACK` | `vaapi` | Where Jellyfin goes while llama.cpp owns the card; one of Jellyfin's own values, `none` restores CPU. |
+| `JELLYFIN_ACCEL_GPU` | `nvenc` | Where Jellyfin goes back to when the card is free: the card's own encoder. |
 | `COMFY_CONTAINER` | empty | Empty = no start/stop control. |
 | `COMFY_URL` | empty | Its API, for the queue depth and the VRAM it sees. |
 | `COMFY_UI_URL` | empty | Link out to its web UI. |

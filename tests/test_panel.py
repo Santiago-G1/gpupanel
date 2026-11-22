@@ -105,6 +105,12 @@ def test_minimal_setup_reports_consumers_unconfigured(panel):
         "comfyui_api": False,
         "llama_logs": True,
         "llama_models_dir": False,
+        "jellyfin_fallback": "vaapi",
+        "jellyfin_accel_gpu": "nvenc",
+        "jellyfin_accel_types": [
+            {"value": v, "label": panel.JELLYFIN_ACCEL_LABELS[v]}
+            for v in panel.JELLYFIN_ACCEL_TYPES
+        ],
     }
     assert status["immich_ml"] == "unconfigured"
     assert status["jellyfin_accel"] == "unconfigured"
@@ -1122,6 +1128,53 @@ def test_amd_without_its_tools_still_gets_a_power_limit_through_hwmon(panel):
     assert card["setter"] == "sysfs"
     # One command per card is possible: each card has its own hwmon node.
     assert card["power_per_card"] is True
+
+
+@pytest.mark.parametrize("accel", ["none", "amf", "qsv", "nvenc", "v4l2m2m", "vaapi",
+                                   "videotoolbox", "rkmpp"])
+def test_jellyfin_takes_every_acceleration_it_accepts(monkeypatch, tmp_path, accel):
+    # The panel used to accept three of Jellyfin's eight values: a host with an
+    # AMD or an Intel card could not put Jellyfin on its own encoder.
+    panel = load(monkeypatch, tmp_path, JELLYFIN_HOST="root@jf.test", JELLYFIN_XML="/config/encoding.xml")
+    monkeypatch.setattr(panel, "ssh_script", lambda host, script, **kw: Proc())
+
+    assert panel.jellyfin_set_accel(accel)["accel"] == accel
+
+
+def test_an_acceleration_jellyfin_does_not_have_names_the_ones_it_does(panel):
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.jellyfin_set_accel("cuda")
+    assert exc.value.status_code == 400
+    assert "amf" in exc.value.detail and "qsv" in exc.value.detail
+
+
+def test_a_typo_in_the_configured_accelerator_stops_the_panel(monkeypatch, tmp_path):
+    # Silently falling back to vaapi hid the typo and moved Jellyfin elsewhere.
+    with pytest.raises(RuntimeError, match="JELLYFIN_ACCEL_GPU"):
+        load(monkeypatch, tmp_path, JELLYFIN_ACCEL_GPU="nvnec")
+
+
+def test_the_card_goes_back_to_the_configured_accelerator(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, JELLYFIN_HOST="root@jf.test", JELLYFIN_XML="/config/encoding.xml", JELLYFIN_ACCEL_GPU="amf")
+    called = []
+    monkeypatch.setattr(panel, "jellyfin_accel", lambda: "vaapi")
+    monkeypatch.setattr(panel, "jellyfin_set_accel",
+                        lambda a: called.append(a) or {"accel": a})
+
+    panel.jellyfin_reclaim_gpu()
+
+    assert called == ["amf"]
+
+
+def test_an_accelerator_the_panel_did_not_write_is_reported_as_a_failure(monkeypatch, tmp_path):
+    # sed exits 0 when the tag is missing: the panel must not claim it worked.
+    panel = load(monkeypatch, tmp_path, JELLYFIN_HOST="root@jf.test", JELLYFIN_XML="/config/encoding.xml")
+    monkeypatch.setattr(panel, "ssh_script",
+                        lambda host, script, **kw: Proc(returncode=1, stderr="no match"))
+
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.jellyfin_set_accel("qsv")
+    assert exc.value.status_code == 502
 
 
 def test_a_card_that_went_blind_is_its_own_event(panel):

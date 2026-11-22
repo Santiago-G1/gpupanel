@@ -45,6 +45,7 @@ services:
       - JELLYFIN_XML=${JELLYFIN_XML:-}
       - JELLYFIN_CONTAINER=${JELLYFIN_CONTAINER:-}
       - JELLYFIN_FALLBACK=${JELLYFIN_FALLBACK:-vaapi}
+      - JELLYFIN_ACCEL_GPU=${JELLYFIN_ACCEL_GPU:-nvenc}
       - COMFY_CONTAINER=${COMFY_CONTAINER:-}
       # COMFY_URL is the LAN address: in its own container 127.0.0.1 is itself.
       - COMFY_URL=${COMFY_URL:-}

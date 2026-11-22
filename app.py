@@ -145,12 +145,38 @@ JELLYFIN = bool(JELLYFIN_HOST and JELLYFIN_XML)
 COMFY = bool(COMFY_CONTAINER)
 COMFY_API = bool(COMFY_URL)
 
-# Where Jellyfin transcodes while llama.cpp owns the card: the other GPU
-# (nvenc), the integrated one (vaapi) or the CPU (none).
-JELLYFIN_FALLBACK = optional("JELLYFIN_FALLBACK") or "vaapi"
-JELLYFIN_DEVICES = {"nvenc": "GPU (NVENC)", "vaapi": "integrated GPU (VAAPI)", "none": "CPU"}
-if JELLYFIN_FALLBACK not in ("vaapi", "none"):
-    JELLYFIN_FALLBACK = "vaapi"
+# Jellyfin's own acceleration enum, as the build itself accepts it. The panel
+# does not guess better than the build it talks to: any host (AMD, Intel, ARM,
+# macOS) uses its own value, and the two names below are plain configuration.
+JELLYFIN_ACCEL_TYPES = ("none", "amf", "qsv", "nvenc", "v4l2m2m", "vaapi", "videotoolbox", "rkmpp")
+JELLYFIN_ACCEL_LABELS = {
+    "none": "CPU (no acceleration)",
+    "amf": "AMD AMF",
+    "qsv": "Intel QuickSync (QSV)",
+    "nvenc": "NVIDIA NVENC",
+    "v4l2m2m": "V4L2 M2M",
+    "vaapi": "VAAPI",
+    "videotoolbox": "VideoToolbox",
+    "rkmpp": "Rockchip MPP",
+}
+
+
+def accel_or_fail(value, name, default):
+    """A configured accelerator, or a loud stop: a typo must not fall back."""
+    chosen = (value or default).strip().lower()
+    if chosen not in JELLYFIN_ACCEL_TYPES:
+        raise RuntimeError(f"{name}={chosen!r} is not one of {', '.join(JELLYFIN_ACCEL_TYPES)}")
+    return chosen
+
+
+# Where Jellyfin goes while llama.cpp owns the card.
+JELLYFIN_FALLBACK = accel_or_fail(optional("JELLYFIN_FALLBACK"), "JELLYFIN_FALLBACK", "vaapi")
+# The card's own accelerator, for the modes that hand the card back to it.
+JELLYFIN_ACCEL_GPU = accel_or_fail(optional("JELLYFIN_ACCEL_GPU"), "JELLYFIN_ACCEL_GPU", "nvenc")
+
+
+def accel_label(value):
+    return JELLYFIN_ACCEL_LABELS.get(value, value)
 
 # Models the dashboard may name (case-insensitive substrings). Anything else the
 # router serves still loads and unloads, but is never printed. Empty lists all.
@@ -298,6 +324,10 @@ SESSION_KEY = hashlib.sha256(f"session|{PANEL_PASSWORD}|{PANEL_TOKEN}".encode())
 state = copy.deepcopy(DEFAULTS)
 # Reentrant: record_action() takes it and then saves, which takes it again.
 STATE_LOCK = threading.RLock()
+# One writer at a time around read-the-card, apply, remember: two of these
+# racing leave the saved value decided by whichever command finished last, not
+# by the one the operator asked for.
+POWER_LOCK = threading.Lock()
 # The consumer probes are independent SSH/HTTP round trips; run them at once.
 PROBE_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="probe")
 last_busy = time.time()
@@ -320,6 +350,32 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="GPU control panel", lifespan=lifespan)
 # Shared by the dashboard and the guide.
 app.mount("/static", StaticFiles(directory=os.path.join(APP_DIR, "static")), name="static")
+
+# The page is a single document with its script inline, so the policy cannot
+# forbid inline script; what it does forbid is being framed (a click on "set
+# 350 W" inside someone else's page) and loading anything from elsewhere.
+SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; base-uri 'none'; object-src 'none'; "
+        "frame-ancestors 'none'; form-action 'self'; img-src 'self' data:; "
+        "connect-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'"
+    ),
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for name, value in SECURITY_HEADERS.items():
+        # setdefault: the pages bring their own Cache-Control and must keep it.
+        response.headers.setdefault(name, value)
+    if request.url.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
 
 
 # --- state ---
@@ -1074,17 +1130,22 @@ def jellyfin_accel():
 
 
 def jellyfin_set_accel(accel):
-    if accel not in ("nvenc", "vaapi", "none"):
-        raise HTTPException(400, "accel must be nvenc, vaapi or none")
+    if accel not in JELLYFIN_ACCEL_TYPES:
+        raise HTTPException(400, "accel must be one of " + ", ".join(JELLYFIN_ACCEL_TYPES))
     if not JELLYFIN:
         return {"accel": accel, "skipped": "Jellyfin is not configured"}
     script = (
         "set -e\n"
         f"F={JELLYFIN_XML}\n"
+        # Whatever happens, the container comes back up: a failed edit must not
+        # leave Jellyfin stopped.
+        f"trap 'docker start {JELLYFIN_CONTAINER} >/dev/null 2>&1 || true' EXIT\n"
         f"docker stop {JELLYFIN_CONTAINER} >/dev/null\n"
         "sed -i 's#<HardwareAccelerationType>[^<]*</HardwareAccelerationType>"
         f"#<HardwareAccelerationType>{accel}</HardwareAccelerationType>#' \"$F\"\n"
-        f"docker start {JELLYFIN_CONTAINER} >/dev/null\n"
+        # sed exits 0 even when it changed nothing: without this the panel would
+        # report an accelerator Jellyfin never got.
+        f"grep -q '<HardwareAccelerationType>{accel}</HardwareAccelerationType>' \"$F\"\n"
     )
     p = ssh_script(JELLYFIN_HOST, script)
     if p.returncode != 0:
@@ -1103,14 +1164,14 @@ def jellyfin_ensure_accel(accel):
 def jellyfin_release_gpu():
     """Move Jellyfin off the card, remembering the device it had before."""
     current = jellyfin_accel()
-    if current in ("nvenc", "vaapi"):
+    if current in JELLYFIN_ACCEL_TYPES and current != "none":
         state["jellyfin_before_llm"] = current
     return jellyfin_ensure_accel(JELLYFIN_FALLBACK)
 
 
 def jellyfin_reclaim_gpu():
     """Undo jellyfin_release_gpu() once llama.cpp gives the card back."""
-    accel = state.get("jellyfin_before_llm") or "nvenc"
+    accel = state.get("jellyfin_before_llm") or JELLYFIN_ACCEL_GPU
     state["jellyfin_before_llm"] = None
     return jellyfin_ensure_accel(accel)
 
@@ -1432,16 +1493,27 @@ def auto_tick():
             comfy_up = False
             done.append("ComfyUI stopped")
         if not llm_blocked:
-            # Immich ML is CUDA and cannot share; Jellyfin keeps transcoding on
-            # whatever device the fallback names.
-            with contextlib.suppress(HTTPException):
-                if IMMICH:
+            # Immich ML cannot share the card, and Jellyfin keeps transcoding on
+            # whatever device the fallback names. Each one is tried on its own:
+            # the first failing must not keep the second from moving.
+            stuck = []
+            if IMMICH:
+                try:
                     immich_ml("stop")
                     done.append("Immich ML stopped")
-                if JELLYFIN:
+                except HTTPException:
+                    stuck.append("Immich ML")
+            if JELLYFIN:
+                try:
                     jellyfin_release_gpu()
-                    done.append(f"Jellyfin on {JELLYFIN_DEVICES[JELLYFIN_FALLBACK]}")
-            llm_blocked = True
+                    done.append(f"Jellyfin on {accel_label(JELLYFIN_FALLBACK)}")
+                except HTTPException:
+                    stuck.append("Jellyfin")
+            # Blocked only once the card really is llama.cpp's.
+            llm_blocked = not stuck
+            if stuck:
+                record_action(f"LLM in use: could not move {', '.join(stuck)}, retrying")
+                done.clear()
         # Outside the `llm_blocked` check: a ComfyUI that was stopped on a later
         # tick still happened, and the last-action line is the only record of it.
         if done:
@@ -1456,7 +1528,7 @@ def auto_tick():
                         back.append("Immich ML on")
                     if JELLYFIN:
                         accel = jellyfin_reclaim_gpu().get("accel")
-                        back.append(f"Jellyfin back to {JELLYFIN_DEVICES.get(accel, accel)}")
+                        back.append(f"Jellyfin back to {accel_label(accel)}")
                 llm_blocked = False
                 names = ", ".join(model_names([{"id": u["model"]} for u in unloaded]))
                 record_action(f"GPU idle {idle // 60} min: unloaded {names}"
@@ -1595,6 +1667,10 @@ def status(_: str = Depends(require_auth)):
     out["configured"] = {
         "immich": IMMICH,
         "jellyfin": JELLYFIN,
+        "jellyfin_fallback": JELLYFIN_FALLBACK,
+        "jellyfin_accel_gpu": JELLYFIN_ACCEL_GPU,
+        "jellyfin_accel_types": [{"value": v, "label": JELLYFIN_ACCEL_LABELS[v]}
+                                 for v in JELLYFIN_ACCEL_TYPES],
         "comfyui": COMFY,
         "comfyui_api": COMFY_API,
         "llama_logs": bool(AI_HOST),
@@ -1693,16 +1769,21 @@ def set_mode(mode: str, _: str = Depends(require_auth)):
             attempt(result, "immich_ml", lambda: immich_ml("stop"), done, "Immich ML stopped")
         if JELLYFIN:
             attempt(result, "jellyfin", jellyfin_release_gpu, done,
-                    f"Jellyfin on {JELLYFIN_DEVICES[JELLYFIN_FALLBACK]}")
-        llm_blocked = True
-        record_action(f"mode LLM: {', '.join(done) or 'nothing to move'} (card free for llama.cpp)")
+                    f"Jellyfin on {accel_label(JELLYFIN_FALLBACK)}")
+        # A consumer that did not move still holds the card: claiming the card is
+        # free is how the operator ends up with an OOM instead of an error.
+        stuck = [key for key, value in result.items()
+                 if isinstance(value, dict) and value.get("error")]
+        llm_blocked = not stuck
+        record_action(f"mode LLM: {', '.join(done) or 'nothing to move'}"
+                      + (f" ({', '.join(stuck)} did not follow)" if stuck else " (card free for llama.cpp)"))
     elif mode == "media":
         unload_models(result, done)
         if IMMICH:
             attempt(result, "immich_ml", lambda: immich_ml("start"), done, "Immich ML on")
         if JELLYFIN:
-            attempt(result, "jellyfin", lambda: jellyfin_ensure_accel("nvenc"), done,
-                    f"Jellyfin on {JELLYFIN_DEVICES['nvenc']}")
+            attempt(result, "jellyfin", lambda: jellyfin_ensure_accel(JELLYFIN_ACCEL_GPU), done,
+                    f"Jellyfin on {accel_label(JELLYFIN_ACCEL_GPU)}")
         state["jellyfin_before_llm"] = None
         llm_blocked = False
         record_action(f"mode Media: {', '.join(done) or 'nothing to move'}")
@@ -1710,20 +1791,20 @@ def set_mode(mode: str, _: str = Depends(require_auth)):
         if IMMICH:
             attempt(result, "immich_ml", lambda: immich_ml("start"), done, "Immich ML on")
         if JELLYFIN:
-            attempt(result, "jellyfin", lambda: jellyfin_ensure_accel("nvenc"), done,
-                    f"Jellyfin on {JELLYFIN_DEVICES['nvenc']}")
+            attempt(result, "jellyfin", lambda: jellyfin_ensure_accel(JELLYFIN_ACCEL_GPU), done,
+                    f"Jellyfin on {accel_label(JELLYFIN_ACCEL_GPU)}")
         state["jellyfin_before_llm"] = None
         llm_blocked = False
         record_action(f"mode Shared: {', '.join(done) or 'nothing to move'} (llama.cpp not unloaded)")
     else:
-        # Image generation needs the whole card: unload llama.cpp, stop the CUDA
+        # Image generation needs the whole card: unload llama.cpp, stop the
         # Immich workload and move Jellyfin off (it keeps transcoding).
         unload_models(result, done)
         if IMMICH:
             attempt(result, "immich_ml", lambda: immich_ml("stop"), done, "Immich ML stopped")
         if JELLYFIN:
             attempt(result, "jellyfin", jellyfin_release_gpu, done,
-                    f"Jellyfin on {JELLYFIN_DEVICES[JELLYFIN_FALLBACK]}")
+                    f"Jellyfin on {accel_label(JELLYFIN_FALLBACK)}")
         state["jellyfin_before_llm"] = None
         if COMFY:
             attempt(result, "comfyui", lambda: comfy("start"), done,
@@ -1800,6 +1881,13 @@ def restore_power_limits(attempts=6, delay=10):
     "nothing to do". A card that is gone, or that no longer accepts the value,
     is logged and skipped: the panel still has to serve.
     """
+    with POWER_LOCK:
+        _restore_power_limits(attempts, delay)
+
+
+def _restore_power_limits(attempts, delay):
+    # Read under the lock: a limit the operator changed while this thread was
+    # waiting must not be overwritten with the value it saw at start.
     saved = dict(state.get("power_limits") or {})
     if not saved:
         return
@@ -1870,6 +1958,11 @@ def set_power(body: dict = Body(...), _: str = Depends(require_auth)):
     every settable card. `{"cards": [{"index": 0, "watts": 150}]}` is the
     advanced control, where each card answers for its own range.
     """
+    with POWER_LOCK:
+        return _set_power(body)
+
+
+def _set_power(body):
     cards = gpu_status()["gpus"]
     advanced = body.get("cards")
 
@@ -1967,6 +2060,11 @@ def power_factory(_: str = Depends(require_auth)):
     the lower cap a host may boot with. The saved limits are forgotten in the
     same breath, so the next start does not undo it.
     """
+    with POWER_LOCK:
+        return _power_factory()
+
+
+def _power_factory():
     cards = gpu_status()["gpus"]
     planned, skipped, shared = [], [], set()
     for card in cards:
