@@ -575,10 +575,16 @@ def sysfs_card(raw, vendor, tools):
     """
     cap_min, cap_max = raw.get("cap_min"), raw.get("cap_max")
     setter = None
-    if vendor == "amd" and _tidy(cap_min) != "N/A" and _tidy(cap_max) != "N/A":
-        setter = "amd-smi" if tools.get("amd-smi") else ("rocm-smi" if tools.get("rocm-smi") else None)
+    if _tidy(cap_min) != "N/A" and _tidy(cap_max) != "N/A":
+        if vendor == "amd":
+            setter = "amd-smi" if tools.get("amd-smi") else ("rocm-smi" if tools.get("rocm-smi") else "sysfs")
+        else:
+            # Intel Arc and any other card whose driver exposes power1_cap: the
+            # kernel takes the write even when the vendor ships no tool.
+            setter = "sysfs"
     return {
         "index": str(raw.get("drm") or "").removeprefix("card") or None,
+        "drm": raw.get("drm") or None,
         # The UUID is what nvidia-smi calls identity; amdgpu has `unique_id` and
         # the PCI address is the one every vendor has.
         "uuid": raw.get("unique_id") or raw.get("bdf") or None,
@@ -605,7 +611,7 @@ def sysfs_card(raw, vendor, tools):
         "power_settable": bool(setter),
         # `amd-smi set -g` takes one card; `rocm-smi --setpoweroverdrive` is one
         # value for the whole machine, so per-card is a promise it cannot keep.
-        "power_per_card": setter == "amd-smi",
+        "power_per_card": setter in ("amd-smi", "sysfs", "nvidia-smi"),
         "setter": setter,
         "aer": _aer(raw),
     }
@@ -706,6 +712,12 @@ def power_command(card, watts):
         return f"amd-smi set -g {index} --power-cap {watts}"
     if setter == "rocm-smi":
         return f"rocm-smi --setpoweroverdrive {watts}"
+    if setter == "sysfs" and card.get("drm"):
+        micro = int(round(float(watts) * 1000000))
+        # The hwmon number is assigned by the driver, so it is globbed rather
+        # than remembered: reinstalling the driver renumbers it.
+        return (f"for f in /sys/class/drm/{card['drm']}/device/hwmon/hwmon*/power1_cap; "
+                f"do echo {micro} > \"$f\" || exit 1; done")
     return None
 
 

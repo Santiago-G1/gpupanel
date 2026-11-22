@@ -1091,6 +1091,39 @@ def test_an_intel_card_has_no_power_control(panel):
     assert "no card" in exc.value.detail
 
 
+def test_an_intel_card_that_exposes_its_range_is_settable_through_hwmon(panel):
+    # An Arc reports power1_cap* like any other modern driver, so the panel must
+    # not restrict the power control to the vendors it happens to know.
+    stub_probe(
+        panel,
+        sysfs=[{"bdf": "0000:03:00.0", "drm": "card1", "vendor": "0x8086", "driver": "xe",
+                "name": "Arc A770", "cap": "190000000", "cap_default": "225000000",
+                "cap_min": "100000000", "cap_max": "228000000"}],
+    )
+    card = panel.gpu_status()["gpus"][0]
+
+    assert (card["setter"], card["power_settable"], card["power_per_card"]) == ("sysfs", True, True)
+    # The default comes from hwmon, which is what makes Factory work off NVIDIA.
+    assert card["power_default"] == "225.00"
+    assert panel.power_command(card, 150) == (
+        "for f in /sys/class/drm/card1/device/hwmon/hwmon*/power1_cap; "
+        'do echo 150000000 > "$f" || exit 1; done')
+
+
+def test_amd_without_its_tools_still_gets_a_power_limit_through_hwmon(panel):
+    stub_probe(
+        panel,
+        tools={"amd-smi": False, "rocm-smi": False},
+        sysfs=[{"bdf": "0000:03:00.0", "drm": "card0", "vendor": "0x1002", "driver": "amdgpu",
+                "name": "Radeon RX 7900 XTX", "cap_min": "150000000", "cap_max": "300000000"}],
+    )
+    card = panel.gpu_status()["gpus"][0]
+
+    assert card["setter"] == "sysfs"
+    # One command per card is possible: each card has its own hwmon node.
+    assert card["power_per_card"] is True
+
+
 def test_a_card_that_went_blind_is_its_own_event(panel):
     board = [{"uuid": "GPU-1111-2222", "name": "Tesla P100", "pci": "0000:01:00.0",
               "index": "0", "driver_visible": True}]

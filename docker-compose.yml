@@ -51,7 +51,7 @@ services:
       - COMFY_UI_URL=${COMFY_UI_URL:-}
     volumes:
       # The key that reaches the hosts this panel drives.
-      - /root/.ssh:/root/.ssh:ro
+      - ${SSH_PATH:-/root/.ssh}:/root/.ssh:ro
       # Settings survive a recreate, as a plain file under ./state: visible,
       # backupable, and not deleted by `docker compose down -v`.
       - ./state:/state
