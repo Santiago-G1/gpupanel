@@ -189,6 +189,53 @@ def test_power_limit_is_bounded_by_the_card(panel):
     assert panel.set_power({"watts": 250}, "t")["ok"] is True
 
 
+def test_each_card_can_take_its_own_limit(panel):
+    stub_gpu(panel, card(index="0", power_min="100", power_max="250"),
+             card(index="1", uuid="GPU-bbbb", power_min="150", power_max="300"))
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+
+    out = panel.set_power({"cards": [{"index": "0", "watts": 150},
+                                     {"index": "1", "watts": 250}]}, "t")
+
+    assert calls == ["nvidia-smi -i 0 -pl 150", "nvidia-smi -i 1 -pl 250"]
+    assert out["ok"] is True
+    assert [c["index"] for c in out["cards"]] == ["0", "1"]
+
+
+def test_a_per_card_limit_is_bounded_by_that_card(panel):
+    stub_gpu(panel, card(index="0", power_min="100", power_max="250"),
+             card(index="1", uuid="GPU-bbbb", power_min="150", power_max="300"))
+    panel.ssh = lambda host, command, timeout=30: Proc()
+
+    # 120 W is inside card 0's range and below card 1's floor.
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.set_power({"cards": [{"index": "1", "watts": 120}]}, "t")
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "GPU 1: watts must be between 150 and 300"
+
+    assert panel.set_power({"cards": [{"index": "0", "watts": 120}]}, "t")["ok"] is True
+
+
+def test_an_unknown_card_is_an_error_not_a_silent_skip(panel):
+    stub_gpu(panel, card(index="0"))
+    panel.ssh = lambda host, command, timeout=30: Proc()
+
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.set_power({"cards": [{"index": "9", "watts": 150}]}, "t")
+    assert exc.value.status_code == 400
+    assert "no card" in exc.value.detail
+
+
+def test_an_empty_card_list_is_refused(panel):
+    stub_gpu(panel, card(index="0"))
+    panel.ssh = lambda host, command, timeout=30: Proc()
+
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.set_power({"cards": []}, "t")
+    assert exc.value.status_code == 400
+
+
 def test_power_is_applied_to_every_card(panel):
     stub_gpu(panel, card(index="0"), card(index="1", uuid="GPU-bbbb"))
     calls = []

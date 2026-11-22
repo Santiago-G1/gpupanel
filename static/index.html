@@ -40,6 +40,12 @@
       <input type="range" id="pl" min="125" max="250" step="5" value="150">
       <span class="mono" id="pl-val">150 W</span>
       <button class="pri" id="pl-apply">Apply</button>
+      <button id="pl-adv" aria-pressed="false" aria-controls="pl-advanced">Advanced</button>
+    </div>
+    <div id="pl-advanced" hidden>
+      <div class="k" style="margin:12px 0 6px">One limit per card. The host's boot
+        configuration writes its own values back on the next reboot or deploy.</div>
+      <div id="pl-cards"></div>
     </div>
   </div>
 
@@ -349,6 +355,7 @@ function paintState(s) {
   at.className = autoState.enabled ? 'on' : 'warn';
 
   syncPower();
+  if (!$('pl-advanced').hidden && !$('pl-advanced').contains(document.activeElement)) renderAdvanced();
 }
 
 // The cards that report a range, which is not every card and not every vendor:
@@ -376,6 +383,51 @@ function syncPower() {
   // setBusy() restores the button afterwards.
   if (!btn.classList.contains('busy')) btn.disabled = same;
   btn.title = same ? 'The current limit is already ' + watts + ' W' : '';
+}
+
+// One control per card. Built on demand and left alone while the pointer is
+// inside it, so a refresh during a drag does not rewrite the slider.
+function renderAdvanced() {
+  const box = $('pl-cards');
+  const cards = settableCards();
+  if (!cards.length) {
+    box.innerHTML = '<div class="k">No card on this host reports a settable range.</div>';
+    return;
+  }
+  box.innerHTML = cards.map((x) => {
+    const low = num(x.power_min);
+    const high = num(x.power_max);
+    const now = num(x.power_limit);
+    const index = esc(x.index ?? '');
+    const value = now !== null ? now : low;
+    return `<div class="row" style="margin:6px 0;gap:8px;align-items:center">
+      <span class="k" style="min-width:220px"><b style="color:var(--fg)">GPU ${index}</b>${x.name ? ' · ' + esc(x.name) : ''}</span>
+      <input type="range" class="pl-card" data-index="${index}" min="${low}" max="${high}" step="1" value="${value}">
+      <span class="mono pl-card-val" data-index="${index}" style="min-width:56px">${value} W</span>
+      <span class="k mono" style="opacity:.7">${low}–${high} W</span>
+      <button class="pl-card-apply" data-index="${index}">Apply</button>
+    </div>`;
+  }).join('');
+
+  box.querySelectorAll('input.pl-card').forEach((input) => {
+    input.oninput = () => {
+      const out = box.querySelector('.pl-card-val[data-index="' + input.dataset.index + '"]');
+      if (out) out.textContent = input.value + ' W';
+    };
+  });
+  box.querySelectorAll('button.pl-card-apply').forEach((btn) => {
+    btn.onclick = async () => {
+      const index = btn.dataset.index;
+      const input = box.querySelector('input.pl-card[data-index="' + index + '"]');
+      const watts = Number(input.value);
+      const card = cards.find((x) => String(x.index) === index);
+      if (card && Number(card.power_limit) === watts) return skip('GPU ' + index + ' is already at ' + watts + ' W');
+      const r = await act(btn, '/api/power', {cards: [{index: Number(index), watts}]},
+        {pending: 'Setting GPU ' + index + ' to ' + watts + ' W…', done: 'GPU ' + index + ' = ' + watts + ' W'});
+      const bad = (r && Array.isArray(r.cards) ? r.cards : []).filter((c) => c.ok === false);
+      if (bad.length) msg('GPU ' + index + ' refused ' + watts + ' W: ' + (bad[0].error || 'the driver said no'), true);
+    };
+  });
 }
 
 // The card set is the one thing the driver is silent about: a card that does not
@@ -607,6 +659,14 @@ async function refresh() {
 }
 
 /* ----------------------------------------------------------------- actions */
+$('pl-adv').onclick = () => {
+  const box = $('pl-advanced');
+  const open = box.hidden;
+  box.hidden = !open;
+  $('pl-adv').setAttribute('aria-pressed', open ? 'true' : 'false');
+  if (open) renderAdvanced();
+};
+
 $('pl').addEventListener('input', (e) => {
   $('pl-val').textContent = e.target.value + ' W';
   syncPower();

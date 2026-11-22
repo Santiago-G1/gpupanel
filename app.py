@@ -1708,51 +1708,102 @@ def set_auto(body: dict = Body(...), _: str = Depends(require_auth)):
     return auto_snapshot()
 
 
-@app.post("/api/power")
-def set_power(body: dict = Body(...), _: str = Depends(require_auth)):
-    try:
-        watts = int(body.get("watts"))
-    except (TypeError, ValueError):
-        raise HTTPException(400, "watts must be an integer") from None
-    # The range is the cards', not a constant, and two cards in one machine can
-    # differ: validate against the widest range and then let each card answer for
-    # itself, because `nvidia-smi -pl` without `-i` fails as a whole as soon as
-    # one of them does not accept the value.
-    cards = gpu_status()["gpus"]
-    commands = [(card, power_command(card, watts)) for card in cards]
-    settable = [(card, command) for card, command in commands if command]
-    skipped = [(card, command) for card, command in commands if not command]
-    ranges = [(card.get("index"), as_number(card.get("power_min"), None), as_number(card.get("power_max"), None))
-              for card, _ in settable]
-    known = [(index, low, high) for index, low, high in ranges if low is not None and high is not None]
-    if known:
-        low, high = min(low for _, low, _ in known), max(high for _, _, high in known)
-        if not low <= watts <= high:
-            raise HTTPException(400, f"watts must be between {int(low)} and {int(high)}")
+def _apply_power(planned):
+    """Run one command per card. Returns the per-card answer, refusals included."""
+    settable = [(card, watts, command) for card, watts, command in planned if command]
+    skipped = [card for card, _, command in planned if not command]
     if not settable:
         raise HTTPException(400, "no card on this host exposes a settable power limit")
 
     results = []
-    for card, command in settable:
+    for card, watts, command in settable:
         p = ssh(GPU_HOST, command)
         entry = {"index": card.get("index"), "ok": p.returncode == 0}
         if p.returncode != 0:
             entry["error"] = (p.stderr or p.stdout).strip()[:200] or "the driver refused the limit"
         results.append(entry)
-    for card, _ in skipped:
+    for card in skipped:
         # Not a refusal: a vendor with no power cap is a different answer than
         # a card that was asked and said no.
         results.append({"index": card.get("index"), "vendor": card.get("vendor"),
                         "skipped": "this vendor exposes no power limit"})
     if not any(entry.get("ok") for entry in results):
         raise HTTPException(502, results[0].get("error") or "no card accepted the limit")
+    return results
 
+
+@app.post("/api/power")
+def set_power(body: dict = Body(...), _: str = Depends(require_auth)):
+    """One limit for every card, or one limit for one card.
+
+    `{"watts": 175}` drives the dashboard's single slider: the same value for
+    every settable card. `{"cards": [{"index": 0, "watts": 150}]}` is the
+    advanced control, where each card answers for its own range.
+    """
+    cards = gpu_status()["gpus"]
+    advanced = body.get("cards")
+
+    if advanced is None:
+        try:
+            watts = int(body.get("watts"))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "watts must be an integer") from None
+        planned = [(card, watts, power_command(card, watts)) for card in cards]
+        # The range is the cards', not a constant, and two cards in one machine
+        # can differ: validate against the widest range and then let each card
+        # answer for itself, because `nvidia-smi -pl` without `-i` fails as a
+        # whole as soon as one of them does not accept the value.
+        known = []
+        for card, _, command in planned:
+            if not command:
+                continue
+            low = as_number(card.get("power_min"), None)
+            high = as_number(card.get("power_max"), None)
+            if low is not None and high is not None:
+                known.append((low, high))
+        if known:
+            low, high = min(low for low, _ in known), max(high for _, high in known)
+            if not low <= watts <= high:
+                raise HTTPException(400, f"watts must be between {int(low)} and {int(high)}")
+    else:
+        if not isinstance(advanced, list) or not advanced:
+            raise HTTPException(400, "cards must be a non-empty list")
+        by_index = {card.get("index"): card for card in cards}
+        planned = []
+        for entry in advanced:
+            if not isinstance(entry, dict):
+                raise HTTPException(400, "every entry of cards must be an object")
+            index = entry.get("index")
+            card = by_index.get(index)
+            if card is None:
+                raise HTTPException(400, f"this host has no card {index!r}")
+            try:
+                watts = int(entry.get("watts"))
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"cards[{index}].watts must be an integer") from None
+            low = as_number(card.get("power_min"), None)
+            high = as_number(card.get("power_max"), None)
+            if low is not None and high is not None and not low <= watts <= high:
+                raise HTTPException(400, f"GPU {index}: watts must be between {int(low)} and {int(high)}")
+            planned.append((card, watts, power_command(card, watts)))
+
+    asked = {card.get("index"): watts for card, watts, command in planned if command}
+    results = _apply_power(planned)
     refused = [entry["index"] for entry in results if entry.get("ok") is False]
-    record_action(
-        f"power limit = {watts} W"
-        + (f" ({len(refused)} card(s) refused: {', '.join(str(i) for i in refused)})" if refused else "")
-    )
-    return {"ok": not refused, "watts": watts, "cards": results}
+    if advanced is None:
+        summary = f"power limit = {asked[results[0]['index']]} W"
+    else:
+        applied = ", ".join(f"GPU {e['index']} = {asked[e['index']]} W" for e in results
+                            if e.get("ok") and e["index"] in asked)
+        summary = f"power limits: {applied or 'none accepted'}"
+    if refused:
+        summary += f" ({len(refused)} card(s) refused: {', '.join(str(i) for i in refused)})"
+    record_action(summary)
+
+    out = {"ok": not refused, "cards": results}
+    if advanced is None:
+        out["watts"] = asked[results[0]["index"]]
+    return out
 
 
 @app.post("/api/llama/unload")

@@ -242,7 +242,7 @@ it usable from scripts.
 | `/api/status` | GET | Every card the host reports, the processes on them attributed by UUID, `inventory` (cards vs expected), `configured` (which consumers exist here), `auto`, Immich, Jellyfin, the router's models, the folder's models and ComfyUI's stats. |
 | `/api/mode/{llm,media,balanced,image}` | POST | The table above. |
 | `/api/auto` | POST | `enabled` and the three idle timers, `0…1440` minutes. |
-| `/api/power` | POST | The vendor's own command per card (`nvidia-smi -i <index> -pl`, `amd-smi set --power-cap`), bounded by what the cards report. The answer says which ones refused and which ones a vendor exposes no limit for. |
+| `/api/power` | POST | The vendor's own command per card (`nvidia-smi -i <index> -pl`, `amd-smi set --power-cap`), bounded by what the cards report. `{"watts": 175}` is the single slider; `{"cards": [{"index": 0, "watts": 150}]}` changes one card at a time, each checked against its own range. The answer says which ones refused and which ones a vendor exposes no limit for. |
 | `/api/llama/unload` | POST | Unload every resident model. |
 | `/api/llama/logs?lines=200` | GET | `journalctl` of the unit on `AI_HOST` (through `pct exec` when `AI_CTID` is set), capped at 2000 lines. |
 | `/api/comfy/{start,stop,restart}` | POST | The ComfyUI container on `AI_HOST`; skipped when `COMFY_CONTAINER` is empty. |
@@ -252,6 +252,12 @@ it usable from scripts.
 Every `502` carries the failing command's own stderr, because the useful part of
 a broken SSH hop is what the far side said. A timeout is one of those answers:
 `timed out after 30s`, never a traceback.
+
+The power control has two shapes for the same endpoint. The slider applies one
+value to every settable card; **Advanced** opens one control per card, with that
+card's own range, which is what a machine with two different cards needs. The
+limit lives in the driver and not in this panel, so the host's boot
+configuration writes its own value back on the next reboot or deploy.
 
 `/api/status` is the document a widget or a script parses, so here it is,
 abridged and with the numbers shortened:
