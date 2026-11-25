@@ -287,6 +287,8 @@ echo "@@end"
 # what is known about every card ever seen (name, PCI address, UUID) including
 # the ones that have since disappeared, gpus_events is a short history and
 # gpus_down is the cards that are missing right now with the moment they went.
+# gpus_seq counts the writes to gpus_known, so a caller that took its snapshot
+# before a slow SSH can tell whether the view it is about to write is stale.
 # last_busy is persisted so a container restart does not reset the idle timer.
 DEFAULTS = {
     "enabled": True,
@@ -303,6 +305,7 @@ DEFAULTS = {
     "gpus_events": [],
     "gpus_down": {},
     "gpus_blind": [],
+    "gpus_seq": 0,
     # Per card: the limit the panel last set, so a restart does not lose it.
     "power_limits": {},
     "gpus_aer": {},
@@ -1360,8 +1363,9 @@ def gpu_evidence():
 def card_changes(gpus, keys):
     """What differs from the last observation, read against the state as it is.
 
-    Called twice around the one SSH in `track_gpus`: the second reading sees
-    whatever the other caller recorded meanwhile, and finds nothing left to do.
+    Read once, before the SSH: `gpus_seq` says whether the state moved while
+    that call ran, and when it did the reading is thrown away instead of
+    written over a newer one.
     """
     known = state.get("gpus_known") or []
     blind_now = sorted(card_key(card) for card in gpus if card.get("driver_visible") is False)
@@ -1390,6 +1394,8 @@ def track_gpus(gpus):
     once recorded the same change twice. The kernel evidence is the exception:
     that SSH is a 20 s timeout, and a card going and coming back must not hold
     `save_state()` — and with it every endpoint that takes the lock — for it.
+    Taking the SSH outside the lock means the state can move while it runs, so
+    the deferred write only happens if `gpus_seq` still says nobody else did.
     """
     keys = [card_key(card) for card in gpus]
     meta = {
@@ -1412,6 +1418,7 @@ def track_gpus(gpus):
             state["gpus_names"] = meta
             state["gpus_down"] = {}
             state["gpus_blind"] = sorted(k for k, v in zip(keys, gpus, strict=True) if v.get("driver_visible") is False)
+            state["gpus_seq"] = int(state.get("gpus_seq") or 0) + 1
             save_state()
             return
 
@@ -1419,18 +1426,23 @@ def track_gpus(gpus):
         if not any(changes[key] for key in ("added", "removed", "went_blind", "came_back")):
             # Same cards, maybe reported in another order: not a change.
             return
+        # The card set this call is working from. A 20-second SSH is a long
+        # time for the 20-second tick and `/api/status` both to be in here.
+        seq = state.get("gpus_seq") or 0
 
     evidence = gpu_evidence()
 
     with STATE_LOCK:
-        # The other caller may have recorded this change while the SSH ran.
-        changes = card_changes(gpus, keys)
+        if (state.get("gpus_seq") or 0) != seq:
+            # Another caller recorded a newer card set while the SSH ran, and
+            # this one's view is older than the state: writing it would report
+            # a card that came back as lost, forget the new one, and feed the
+            # flapping count with events that never happened.
+            return
         added, removed = changes["added"], changes["removed"]
         went_blind, came_back = changes["went_blind"], changes["came_back"]
-        if not (added or removed or went_blind or came_back):
-            return
         # Written here, not before the SSH: it is what "went blind" is measured
-        # against, and the other caller may have recorded this change already.
+        # against.
         state["gpus_blind"] = changes["blind_now"]
         at = time.strftime("%Y-%m-%d %H:%M:%S")
         now = time.time()
@@ -1481,6 +1493,7 @@ def track_gpus(gpus):
                     for e in events if e["kind"] == kind]
 
         state["gpus_known"] = keys
+        state["gpus_seq"] = int(state.get("gpus_seq") or 0) + 1
         # A card that is gone keeps its name, which is what makes the next
         # "lost" message readable.
         state["gpus_names"] = {**{key: value for key, value in seen.items() if key in keys or key in down}, **meta}

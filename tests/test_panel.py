@@ -1539,8 +1539,8 @@ def test_the_card_evidence_is_gathered_outside_the_state_lock(panel):
 
 def test_a_change_that_two_callers_see_is_recorded_once(panel):
     # The evidence runs outside the lock, so the other caller can record the
-    # change while this one is still waiting on its SSH: the second look has to
-    # find nothing left to write instead of a duplicate event.
+    # change while this one is still waiting on its SSH: the deferred write has
+    # to find the state moved and drop its older view, not add a second event.
     board = [{"uuid": "GPU-aaaa-1111", "name": "Card A", "index": "0"}]
     panel.track_gpus(board)  # the baseline
     calls = []
@@ -1555,6 +1555,31 @@ def test_a_change_that_two_callers_see_is_recorded_once(panel):
     panel.track_gpus([])
 
     assert [event["kind"] for event in panel.state["gpus_events"]] == ["removed"]
+
+
+def test_a_snapshot_from_before_the_ssh_cannot_undo_a_newer_one(panel):
+    # A sees the board empty and leaves for its 20 s of kernel lines; B records
+    # the same card back plus a new one meanwhile. Writing A's view afterwards
+    # would call both lost, then new on the next poll, and feed the flapping
+    # count with events that never happened.
+    a = {"uuid": "GPU-aaaa-1111", "name": "Card A", "index": "0"}
+    b = {"uuid": "GPU-bbbb-2222", "name": "Card B", "index": "1"}
+    panel.track_gpus([a])  # the baseline
+    calls = []
+
+    def evidence():
+        if not calls:
+            calls.append("first")
+            panel.track_gpus([a, b])  # the other caller, in the middle of the SSH
+        return []
+
+    panel.gpu_evidence = evidence
+    panel.track_gpus([])
+
+    assert [event["kind"] for event in panel.state["gpus_events"]] == ["added"]
+    assert panel.state["gpus_known"] == [a["uuid"], b["uuid"]]
+    assert panel.state["gpus_down"] == {}
+    assert "lost" not in (panel.state["last_action"] or "")
 
 
 # --- Jellyfin left stopped ------------------------------------------------
