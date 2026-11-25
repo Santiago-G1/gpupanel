@@ -1525,10 +1525,14 @@ def auto_tick():
                     done.append(f"Jellyfin on {accel_label(JELLYFIN_FALLBACK)}")
                 except HTTPException:
                     stuck.append("Jellyfin")
+            # ComfyUI holds the card exactly as hard when it would not stop: a
+            # prompt in flight, a container that ignored `stop`.
+            if comfy_up:
+                stuck.append("ComfyUI")
             # Blocked only once the card really is llama.cpp's.
             llm_blocked = not stuck
             if stuck:
-                record_action(f"LLM in use: could not move {', '.join(stuck)}, retrying")
+                record_action(f"LLM in use: {', '.join(stuck)} still on the card, retrying")
                 done.clear()
         # Outside the `llm_blocked` check: a ComfyUI that was stopped on a later
         # tick still happened, and the last-action line is the only record of it.

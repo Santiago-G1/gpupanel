@@ -1455,3 +1455,20 @@ def test_the_schema_is_not_served(panel):
     paths = {getattr(route, "path", "") for route in panel.app.routes}
     assert not paths & {"/docs", "/redoc", "/openapi.json"}
     assert (panel.app.docs_url, panel.app.redoc_url, panel.app.openapi_url) == (None, None, None)
+
+
+# --- the card held by something that would not move -------------------------
+def test_a_comfyui_that_would_not_stop_is_not_a_free_card(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, COMFY_CONTAINER="comfyui")
+    stub_gpu(panel, card(util="90"))
+    panel.llama_models = lambda: [{"id": "big", "status": "loaded"}]
+    monkeypatch.setattr(panel, "comfy_state", lambda: "running")
+    monkeypatch.setattr(panel, "comfy_release", lambda why=None: False)
+
+    panel.auto_tick()
+
+    # `llm_blocked` is "the card is llama.cpp's alone": a ComfyUI that is still
+    # up is not that, and the next tick has to try again instead of recording a
+    # card that was never freed.
+    assert panel.llm_blocked is False
+    assert panel.state["last_action"] == "LLM in use: ComfyUI still on the card, retrying"
