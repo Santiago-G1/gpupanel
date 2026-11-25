@@ -331,6 +331,11 @@ STATE_LOCK = threading.RLock()
 # racing leave the saved value decided by whichever command finished last, not
 # by the one the operator asked for.
 POWER_LOCK = threading.Lock()
+# One kernel-evidence SSH at a time. The dashboard polls every 5 s, and every
+# caller that sees a change before one of them has recorded it would otherwise
+# run its own `journalctl` of up to 20 s on a host whose card is falling off
+# the bus. The lines are best effort: the event is recorded with or without them.
+EVIDENCE_GATE = threading.Lock()
 # The consumer probes are independent SSH/HTTP round trips; run them at once.
 PROBE_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="probe")
 last_busy = time.time()
@@ -1347,17 +1352,26 @@ def gpu_evidence():
     `Xid 79` is a card that fell off the bus, an `amdgpu` ring reset is a driver
     that gave up, and `pcieport` AER lines are the link: the panel cannot fix
     any of it, but it cannot call them the same thing either. One SSH, and only
-    when something actually changed.
+    when something actually changed, and never two of them at once: the event is
+    written whether or not the lines arrive.
     """
     if not GPU_EVIDENCE:
         return []
-    p = ssh(
-        GPU_HOST,
-        "journalctl -k --since '-10 min' -o short-iso --no-pager 2>/dev/null "
-        "| grep -Ei 'NVRM|Xid|AER|pcieport|amdgpu.*(error|reset|ring)' | tail -20",
-        timeout=20,
-    )
-    return [line.strip() for line in (p.stdout or "").splitlines() if line.strip()][-20:]
+    if not EVIDENCE_GATE.acquire(False):
+        # Another caller is already asking: its lines describe the same ten
+        # minutes, and a queue of 20-second SSH calls on a dying host is worse
+        # than an event without them.
+        return []
+    try:
+        p = ssh(
+            GPU_HOST,
+            "journalctl -k --since '-10 min' -o short-iso --no-pager 2>/dev/null "
+            "| grep -Ei 'NVRM|Xid|AER|pcieport|amdgpu.*(error|reset|ring)' | tail -20",
+            timeout=20,
+        )
+        return [line.strip() for line in (p.stdout or "").splitlines() if line.strip()][-20:]
+    finally:
+        EVIDENCE_GATE.release()
 
 
 def card_changes(gpus, keys):

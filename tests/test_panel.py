@@ -1582,6 +1582,41 @@ def test_a_snapshot_from_before_the_ssh_cannot_undo_a_newer_one(panel):
     assert "lost" not in (panel.state["last_action"] or "")
 
 
+def test_the_evidence_ssh_does_not_pile_up(panel):
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc("NVRM: Xid 79\n")
+
+    # Someone else's `journalctl` is still running: this caller gives up instead
+    # of queueing a second one behind it on a host whose card is falling off.
+    assert panel.EVIDENCE_GATE.acquire(False)
+    try:
+        assert panel.gpu_evidence() == []
+        assert calls == []
+    finally:
+        panel.EVIDENCE_GATE.release()
+
+    # Free again, and the lines are still asked for.
+    assert panel.gpu_evidence() == ["NVRM: Xid 79"]
+    assert len(calls) == 1
+
+
+def test_a_change_is_recorded_even_when_the_evidence_is_busy(panel):
+    board = [{"uuid": "GPU-1111-2222", "name": "Tesla P100", "pci": "0000:01:00.0", "index": "0"}]
+    panel.track_gpus(board)
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+
+    assert panel.EVIDENCE_GATE.acquire(False)
+    try:
+        panel.track_gpus([])  # the evidence is busy: the event is still written
+    finally:
+        panel.EVIDENCE_GATE.release()
+
+    assert calls == []
+    event = panel.state["gpus_events"][-1]
+    assert (event["kind"], event["evidence"]) == ("removed", [])
+
+
 # --- Jellyfin left stopped ------------------------------------------------
 def test_the_jellyfin_trap_covers_a_killed_remote_shell(monkeypatch, tmp_path):
     panel = load(monkeypatch, tmp_path, JELLYFIN_HOST="root@jf.test", JELLYFIN_XML="/config/encoding.xml")
