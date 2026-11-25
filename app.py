@@ -1145,6 +1145,14 @@ def jellyfin_accel():
     return p.stdout.strip() or "unknown"
 
 
+def jellyfin_state():
+    """Whether the container is up, read the way Immich's state is."""
+    if not JELLYFIN:
+        return "unconfigured"
+    p = ssh(JELLYFIN_HOST, f"docker inspect -f '{{{{.State.Status}}}}' {JELLYFIN_CONTAINER}")
+    return p.stdout.strip() or "unknown"
+
+
 def jellyfin_set_accel(accel):
     if accel not in JELLYFIN_ACCEL_TYPES:
         raise HTTPException(400, "accel must be one of " + ", ".join(JELLYFIN_ACCEL_TYPES))
@@ -1154,8 +1162,9 @@ def jellyfin_set_accel(accel):
         "set -e\n"
         f"F={JELLYFIN_XML}\n"
         # Whatever happens, the container comes back up: a failed edit must not
-        # leave Jellyfin stopped.
-        f"trap 'docker start {JELLYFIN_CONTAINER} >/dev/null 2>&1 || true' EXIT\n"
+        # leave Jellyfin stopped. A killed SSH ends the remote shell too, and
+        # that is the case EXIT alone does not cover.
+        f"trap 'docker start {JELLYFIN_CONTAINER} >/dev/null 2>&1 || true' EXIT INT TERM HUP\n"
         f"docker stop {JELLYFIN_CONTAINER} >/dev/null\n"
         "sed -i 's#<HardwareAccelerationType>[^<]*</HardwareAccelerationType>"
         f"#<HardwareAccelerationType>{accel}</HardwareAccelerationType>#' \"$F\"\n"
@@ -1173,7 +1182,15 @@ def jellyfin_ensure_accel(accel):
     if not JELLYFIN:
         return {"accel": accel, "skipped": "Jellyfin is not configured"}
     if jellyfin_accel() == accel:
-        return {"accel": accel, "already": True}
+        # The file is already right, but the container may not be: an edit that
+        # failed after `docker stop` leaves it down, and answering "already"
+        # there reports a Jellyfin that serves nothing.
+        if jellyfin_state() == "running":
+            return {"accel": accel, "already": True}
+        p = ssh(JELLYFIN_HOST, f"docker start {JELLYFIN_CONTAINER}")
+        if p.returncode != 0:
+            raise ssh_failure(p, "Jellyfin was not running and did not start")
+        return {"accel": accel, "already": True, "started": True}
     return jellyfin_set_accel(accel)
 
 

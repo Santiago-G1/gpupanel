@@ -7,7 +7,6 @@ or a card that answers `N/A` can be exercised.
 
 import json
 import subprocess
-import threading
 import types
 
 import pytest
@@ -1499,3 +1498,44 @@ def test_the_inventory_is_read_and_written_under_one_lock(panel):
     panel.track_gpus([])  # a change: the evidence runs inside the lock
 
     assert acquired == [False]
+
+
+# --- Jellyfin left stopped ------------------------------------------------
+def test_the_jellyfin_trap_covers_a_killed_remote_shell(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, JELLYFIN_HOST="root@jf.test", JELLYFIN_XML="/config/encoding.xml")
+    seen = []
+
+    def fake_script(host, script, **kwargs):
+        seen.append(script)
+        return Proc()
+
+    monkeypatch.setattr(panel, "ssh_script", fake_script)
+    panel.jellyfin_set_accel("qsv")
+
+    # `set -e` plus a killed SSH: EXIT alone does not run for the second case.
+    assert "trap 'docker start jellyfin >/dev/null 2>&1 || true' EXIT INT TERM HUP" in seen[0]
+
+
+def test_a_jellyfin_container_left_stopped_is_started(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, JELLYFIN_HOST="root@jf.test", JELLYFIN_XML="/config/encoding.xml")
+    calls = []
+
+    def fake_ssh(host, command, timeout=30):
+        calls.append(command)
+        return Proc("exited\n" if "docker inspect" in command else "")
+
+    panel.ssh = fake_ssh
+    monkeypatch.setattr(panel, "jellyfin_accel", lambda: "nvenc")
+
+    assert panel.jellyfin_ensure_accel("nvenc") == {"accel": "nvenc", "already": True, "started": True}
+    assert calls[-1] == "docker start jellyfin"
+
+
+def test_a_jellyfin_that_is_already_up_is_left_alone(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, JELLYFIN_HOST="root@jf.test", JELLYFIN_XML="/config/encoding.xml")
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc("running\n")
+    monkeypatch.setattr(panel, "jellyfin_accel", lambda: "nvenc")
+
+    assert panel.jellyfin_ensure_accel("nvenc") == {"accel": "nvenc", "already": True}
+    assert len(calls) == 1 and "docker inspect" in calls[0]
