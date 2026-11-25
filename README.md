@@ -167,6 +167,11 @@ docker compose up -d --build
 docker compose logs -f gpu-panel
 ```
 
+`docker ps` shows the container `unhealthy` while `GPU_HOST` does not answer:
+the healthcheck is `/api/health`, which reports whether the panel can still read
+the cards. A machine that is off, rebooting or unreachable over SSH turns the
+container unhealthy with the panel itself running fine.
+
 The SSH key under `/root/.ssh` must reach every host you configured
 non-interactively (`BatchMode=yes` is used throughout): `nvidia-smi` on
 `GPU_HOST`, `docker` where the containers are, `pct exec` only if you set
@@ -238,6 +243,7 @@ it usable from scripts.
 
 | Endpoint | Method | What it does |
 | --- | --- | --- |
+| `/api/health` | GET | `ok`, `probe_ok` and the card count, answered from the last card probe and with no SSH of its own. **No auth**, because the container's own healthcheck is the caller: it says whether the panel can still see the card host. |
 | `/api/session` | GET | Who the caller is. The only probe that never leaves the container. |
 | `/api/status` | GET | Every card the host reports, the processes on them attributed by UUID, `inventory` (cards vs expected), `configured` (which consumers exist here), `auto`, Immich, Jellyfin, the router's models, the folder's models and ComfyUI's stats. |
 | `/api/mode/{llm,media,balanced,image}` | POST | The table above. |
@@ -251,9 +257,11 @@ it usable from scripts.
 | `/api/immich/ml/{start,stop,restart}` | POST | `IMMICH_ML_CONTAINER` on `IMMICH_HOST`; skipped when it is not configured. |
 | `/api/jellyfin/accel/{value}` | POST | Rewrite the config and restart `JELLYFIN_CONTAINER`; skipped when not configured. The value is one of Jellyfin's own: `none`, `amf`, `qsv`, `nvenc`, `v4l2m2m`, `vaapi`, `videotoolbox`, `rkmpp`. |
 
-Every `502` carries the failing command's own stderr, because the useful part of
-a broken SSH hop is what the far side said. A timeout is one of those answers:
-`timed out after 30s`, never a traceback.
+Every `502` carries one short sentence, never the failing command's own stderr:
+the far side's answer has the key path, the host name and the card's address in
+it, and the browser is not where those belong. The reason goes to `docker logs`
+at `warning`; the page gets the sentence. A timeout is still a `502`, never a
+traceback.
 
 The power control has two shapes for the same endpoint. The slider applies one
 value to every settable card; **Advanced** opens one control per card, with that
@@ -438,6 +446,11 @@ the Jellyfin device to restore and the card inventory (`gpus_known`, the names o
 cards that have since disappeared, and the last change). Losing it costs a re-login and the timers
 going back to their defaults; the card is where the truth is.
 
+A state file that cannot be written is a startup failure, not a warning: the
+panel raises `RuntimeError` and exits instead of serving without persisting,
+because the revoked nonces are the part that has to survive a restart. A single
+failed save later on is logged and retried by the next one.
+
 ## Licence
 
 MIT — see [`LICENSE`](LICENSE). A hosted derivative that must stay open is the
@@ -448,8 +461,8 @@ to replace.
 
 | Symptom | What it means |
 | --- | --- |
-| `502 card probe failed: … Permission denied (publickey)` | the key in `/root/.ssh` does not reach `GPU_HOST`; nothing else will work either |
-| `502 … timed out after 30s` | a host is unreachable — the panel turns a timeout into a `502`, never a `500` |
+| `502 could not read the cards on the GPU host` | the key in `/root/.ssh` does not reach `GPU_HOST`, or the host is unreachable; nothing else will work either. `docker logs` has the far side's answer |
+| `502` after about thirty seconds, on a host that used to answer | the SSH call gave up: the machine is off, hung or off the network. The panel answers `502` with one sentence, never a `500` |
 | everything reads `not configured` | those variables are empty on purpose; see [Adapting it to your setup](#adapting-it-to-your-setup) |
 | `1 of 2 · 1 card missing` | `GPU_EXPECTED` is above what the probe answers: the card is not initialising |
 | `no card answers` | the host replies and the driver lists no card: `nvidia-smi` fails, the module is unloaded, or every card is off the bus |
@@ -457,7 +470,7 @@ to replace.
 | `a card keeps going and coming back` | three or more drops in the hour: a link, a riser or a power problem, not a card that is simply absent |
 | `429 too many failed logins` | `LOGIN_MAX_FAILURES` failures within `LOGIN_WINDOW`; wait the window out |
 | `Power limit: not reported by the card` | the card exposes no settable range (typical on vGPU); the slider is disabled |
-| `N card(s) refused … W` | the limit was set on the cards that accept it; the others are named with the driver's own error |
+| `N card(s) refused … W` | the limit was set on the cards that accept it; the others refused it, and `docker logs` has each driver's own answer |
 | `Power limit: not settable` | no card on this host reports a range: an Intel iGPU, a vGPU, or an AMD card without `amd-smi`/`rocm-smi` |
 | signed out after changing a password or the token | the session key is derived from both, so rotating either revokes every cookie |
 | the browser keeps asking to log in behind a proxy | the cookie is `Secure` only when the request says HTTPS; forward `X-Forwarded-Proto` |

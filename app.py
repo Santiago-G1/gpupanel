@@ -525,8 +525,9 @@ def require_auth(request: Request) -> str:
 def run(cmd, timeout=30, **kwargs):
     """A command, with its timeout and its missing binary turned into a result.
 
-    Every caller checks `returncode` and reports its stderr, which is a far more
-    useful answer than a 500 from an unreachable host.
+    Every caller checks `returncode` and answers with one sentence of its own:
+    what the far side said goes to the log, which is a far more useful place
+    than a 500 from an unreachable host.
     """
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kwargs)

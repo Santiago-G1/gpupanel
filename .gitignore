@@ -11,10 +11,12 @@
 !.env.template
 
 # RUNTIME STATE
-# The `gpu_panel_state` volume keeps this inside Docker; these cover a manual
-# run from the repository.
+# `./state` is the bind mount the container writes into, so it is here too: the
+# settings and the revoked nonces are not the repository's. The probe file the
+# startup check writes and removes is covered by the same name.
 state/
 auto.json
+auto.json.probe
 
 # PYTHON
 __pycache__/
