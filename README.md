@@ -448,8 +448,18 @@ going back to their defaults; the card is where the truth is.
 
 A state file that cannot be written is a startup failure, not a warning: the
 panel raises `RuntimeError` and exits instead of serving without persisting,
-because the revoked nonces are the part that has to survive a restart. A single
-failed save later on is logged and retried by the next one.
+because the revoked nonces are the part that has to survive a restart. With
+`restart: unless-stopped` that is a container that restarts in a loop and never
+answers; `docker compose logs gpu-panel` names the file and the errno. The check
+covers both halves of a save — creating and renaming a probe file in the
+directory, and opening the state file itself for writing when it already exists
+— so a file bind-mounted `:ro` fails at startup instead of losing the nonces on
+the first save. A single failed save later on is logged and retried by the next
+one.
+
+What the check cannot see is a mount that is not there at all: Docker creates
+the directory in the container's own layer, every probe passes, and the state
+dies with the container.
 
 ## Licence
 
