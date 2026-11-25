@@ -1702,6 +1702,24 @@ def test_a_probe_that_failed_keeps_its_reason_out_of_the_response(panel, caplog)
     assert "Permission denied" in caplog.text
 
 
+def test_a_probe_that_keeps_failing_warns_once(panel, caplog):
+    # The dashboard asks every 5 s: a host that is off must cost one line, not
+    # twelve a minute and one more with every tab left open.
+    panel.probe_cards = lambda: {"host_ok": False, "errors": ["ssh: connect: timed out"]}
+    for _ in range(3):
+        with pytest.raises(panel.HTTPException):
+            panel.gpu_status()
+    assert caplog.messages.count("card probe failed: ssh: connect: timed out") == 1
+
+    # A failure after a good probe is news again.
+    panel.probe_cards = lambda: {"host_ok": True, "cards": []}
+    panel.gpu_status()
+    panel.probe_cards = lambda: {"host_ok": False, "errors": ["ssh: connect: timed out"]}
+    with pytest.raises(panel.HTTPException):
+        panel.gpu_status()
+    assert len([m for m in caplog.messages if m.startswith("card probe failed")]) == 2
+
+
 # --- the models folder is a cached reading ---------------------------------
 def test_the_models_folder_is_read_once_per_window(monkeypatch, tmp_path):
     panel = load(monkeypatch, tmp_path, LLAMA_MODELS_DIR="/mnt/models")

@@ -340,6 +340,9 @@ EVIDENCE_GATE = threading.Lock()
 PROBE_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="probe")
 last_busy = time.time()
 llm_blocked = False
+# Whether the last card probe failed, so an unreachable host costs one log line
+# instead of one per poll while the dashboard is open.
+probe_failing = False
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -922,11 +925,19 @@ def gpu_status():
     Processes are attributed by UUID: without that the second card looks idle.
     Zero cards is not a 502: the inventory turns it into an event with a time.
     """
+    global probe_failing
     probe = probe_cards()
     if not probe["host_ok"]:
-        errors = probe.get("errors") or ["no answer"]
-        log.warning("card probe failed: %s", errors[0][:500])
+        # Once per failure, not once per poll: the dashboard asks every 5 s and
+        # a host that is off would write twelve identical warnings a minute.
+        if not probe_failing:
+            errors = probe.get("errors") or ["no answer"]
+            log.warning("card probe failed: %s", errors[0][:500])
+            probe_failing = True
         raise HTTPException(502, "could not read the cards on the GPU host")
+    if probe_failing:
+        probe_failing = False
+        log.info("card probe answers again")
     return single_card(probe["cards"], probe)
 
 
