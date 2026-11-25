@@ -948,6 +948,12 @@ def test_auto_settings_are_validated(panel):
         panel.set_auto({"llama_idle_min": 5000}, "t")
     assert exc.value.status_code == 400
 
+    # `int()` on a string that is not a number used to be a 500.
+    for value in ("soon", None, [30]):
+        with pytest.raises(panel.HTTPException) as exc:
+            panel.set_auto({"comfy_idle_min": value}, "t")
+        assert exc.value.status_code == 400
+
     assert panel.set_auto({"llama_idle_min": 30, "enabled": False}, "t")["llama_idle_min"] == 30
 
 
@@ -1336,7 +1342,6 @@ def test_a_stopped_comfyui_is_not_asked_twice_in_a_row(monkeypatch, tmp_path):
     assert len(calls) == 1
     assert panel.comfy_state(force=True) == "created"
     assert len(calls) == 2
-
 
 
 # --- the boot-time restore --------------------------------------------------

@@ -1916,7 +1916,10 @@ def set_auto(body: dict = Body(...), _: str = Depends(require_auth)):
         state["enabled"] = bool(body["enabled"])
     for key in ("llama_idle_min", "ml_idle_min", "comfy_idle_min"):
         if key in body:
-            value = int(body[key])
+            try:
+                value = int(body[key])
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"{key} must be a whole number of minutes") from None
             if value < 0 or value > 1440:
                 raise HTTPException(400, f"{key} must be 0..1440 minutes")
             state[key] = value
