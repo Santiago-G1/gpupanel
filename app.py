@@ -2237,8 +2237,12 @@ def reset_settings(_: str = Depends(require_auth)):
     """
     global last_busy
     with STATE_LOCK:
+        # A reset is not a logout: the nonces of logged-out sessions keep their
+        # value, or the reset would hand every revoked cookie back.
+        revoked = state.get("revoked") or {}
         state.clear()
         state.update(copy.deepcopy(DEFAULTS))
+        state["revoked"] = revoked
         save_state()
     last_busy = time.time()
     record_action("settings reset to defaults")

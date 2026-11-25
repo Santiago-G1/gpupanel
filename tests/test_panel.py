@@ -1582,3 +1582,14 @@ def test_a_folder_that_failed_is_not_remembered(monkeypatch, tmp_path):
         panel.models_on_disk()
     # A folder that appears is seen on the next poll, not thirty seconds later.
     assert panel.models_on_disk() == [{"id": "a", "size": 1, "mtime": 1}]
+
+
+# --- a reset is not a logout ------------------------------------------------
+def test_a_reset_does_not_hand_a_revoked_session_back(panel):
+    panel.state["revoked"] = {"nonce": 9999999999}
+    panel.state["llama_idle_min"] = 5
+
+    panel.reset_settings("t")
+
+    assert panel.state["llama_idle_min"] == 60
+    assert panel.state["revoked"] == {"nonce": 9999999999}
