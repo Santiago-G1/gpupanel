@@ -1444,7 +1444,9 @@ def test_health_is_the_last_card_probe(panel):
     body = json.loads(response.body)
     assert response.status_code == 200
     assert (body["ok"], body["probe_ok"], body["cards"]) == (True, True, 1)
-    assert body["probe_age"] < 5
+    # No age: the seconds since the last probe move with the dashboard being
+    # open, and that is the operator's business, not a stranger's.
+    assert set(body) == {"ok", "probe_ok", "cards"}
 
 
 def test_health_is_503_when_the_probe_could_not_reach_the_host(panel):

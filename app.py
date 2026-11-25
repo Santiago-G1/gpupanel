@@ -1742,11 +1742,12 @@ def health():
     """
     age = time.time() - PROBE_STATE["at"]
     fresh = bool(PROBE_STATE["ok"]) and age < HEALTH_PROBE_MAX_AGE
+    # No age in the body: the seconds since the last probe move as soon as the
+    # dashboard is open, which is nobody else's business.
     return JSONResponse(
         {
             "ok": fresh,
             "probe_ok": bool(PROBE_STATE["ok"]),
-            "probe_age": int(age),
             "cards": PROBE_STATE["cards"],
         },
         status_code=200 if fresh else 503,
