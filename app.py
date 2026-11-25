@@ -1877,77 +1877,100 @@ def restore_power_limits(attempts=6, delay=10):
     """Re-apply the limits this panel last set, once the card host answers.
 
     The panel starts after the machine, and `nvidia-smi` can be slow on a host
-    that has just booted, so a failed probe is retried instead of being taken as
-    "nothing to do". A card that is gone, or that no longer accepts the value,
-    is logged and skipped: the panel still has to serve.
+    that has just booted: a probe that answers with no cards, or with cards
+    whose saved key is not enumerated yet, is waited out instead of being taken
+    as "nothing to do". Returning on that first answer left both cards on the
+    250 W they had just booted with, in silence.
+
+    The sleep is outside POWER_LOCK: a host that takes two minutes to come up
+    must not keep `POST /api/power` waiting for it.
     """
-    with POWER_LOCK:
-        _restore_power_limits(attempts, delay)
-
-
-def _restore_power_limits(attempts, delay):
-    # Read under the lock: a limit the operator changed while this thread was
-    # waiting must not be overwritten with the value it saw at start.
-    saved = dict(state.get("power_limits") or {})
-    if not saved:
-        return
-
+    with STATE_LOCK:
+        pending = list(state.get("power_limits") or {})
     for attempt in range(attempts):
+        if not pending:
+            return
+        if attempt:
+            time.sleep(delay)
         try:
-            cards = gpu_status()["gpus"]
+            with POWER_LOCK:
+                pending = _restore_power_limits(pending, attempt, attempts)
         except Exception as exc:  # noqa: BLE001 - the dashboard must come up anyway
             log.warning("power limits: %s (attempt %d/%d)", exc, attempt + 1, attempts)
-            time.sleep(delay)
+    if pending:
+        log.warning("power limits: %d card(s) not applied in %d attempts: %s",
+                    len(pending), attempts, ", ".join(pending))
+        record_action(f"power limits: {len(pending)} card(s) not applied")
+
+
+def _restore_power_limits(pending, attempt, attempts):
+    """One attempt, under POWER_LOCK. Returns the keys that still need a card."""
+    # Re-read under the lock: a limit the operator changed, or forgot, while
+    # this thread was waiting must not be overwritten with the value it saw at
+    # start.
+    saved = dict(state.get("power_limits") or {})
+    cards = gpu_status()["gpus"]
+    if not cards:
+        log.info("power limits: the host answers with no cards yet (attempt %d/%d)",
+                 attempt + 1, attempts)
+        return [key for key in pending if key in saved]
+
+    by_uuid = {card.get("uuid"): card for card in cards if card.get("uuid")}
+    by_index = {card.get("index"): card for card in cards}
+    applied, refused, shared, left = [], [], {}, []
+    for key in pending:
+        if key not in saved:
+            continue
+        raw_watts = saved[key]
+        watts = as_number(raw_watts, None)
+        if watts is None:
+            log.warning("power limits: %s holds %r, not a number", key, raw_watts)
+            continue
+        # The tools take whole watts; a stored 150.0 must not become "150.0".
+        watts = int(watts)
+        card = card_for_key(key, by_uuid, by_index)
+        if card is None:
+            log.info("power limits: nothing on this host matches %s yet (attempt %d/%d)",
+                     key, attempt + 1, attempts)
+            left.append(key)
+            continue
+        low = as_number(card.get("power_min"), None)
+        high = as_number(card.get("power_max"), None)
+        if low is not None and high is not None and not low <= watts <= high:
+            log.warning("power limits: %s cannot take %s W (%s-%s)", key, watts, low, high)
+            continue
+        command = power_command(card, watts)
+        if not command:
+            continue
+        if card.get("power_per_card") is False:
+            # One value for every card that vendor owns: two saved values for
+            # the same tool cannot both be honoured, so the first one wins.
+            setter = card.get("setter")
+            if setter in shared:
+                if shared[setter] != watts:
+                    log.warning("power limits: %s is one value for every card, "
+                                "keeping %s W", setter, shared[setter])
+                continue
+            shared[setter] = watts
+        if as_number(card.get("power_limit"), None) == watts:
             continue
 
-        by_uuid = {card.get("uuid"): card for card in cards if card.get("uuid")}
-        by_index = {card.get("index"): card for card in cards}
-        applied, refused, shared = [], [], {}
-        for key, raw_watts in saved.items():
-            watts = as_number(raw_watts, None)
-            if watts is None:
-                log.warning("power limits: %s holds %r, not a number", key, raw_watts)
-                continue
-            # The tools take whole watts; a stored 150.0 must not become "150.0".
-            watts = int(watts)
-            card = card_for_key(key, by_uuid, by_index)
-            if card is None:
-                log.warning("power limits: nothing on this host matches %s", key)
-                continue
-            low = as_number(card.get("power_min"), None)
-            high = as_number(card.get("power_max"), None)
-            if low is not None and high is not None and not low <= watts <= high:
-                log.warning("power limits: %s cannot take %s W (%s-%s)", key, watts, low, high)
-                continue
-            command = power_command(card, watts)
-            if not command:
-                continue
-            if card.get("power_per_card") is False:
-                # One value for every card that vendor owns: two saved values for
-                # the same tool cannot both be honoured, so the first one wins.
-                setter = card.get("setter")
-                if setter in shared:
-                    if shared[setter] != watts:
-                        log.warning("power limits: %s is one value for every card, "
-                                    "keeping %s W", setter, shared[setter])
-                    continue
-                shared[setter] = watts
-            if as_number(card.get("power_limit"), None) == watts:
-                continue
-
-            p = ssh(GPU_HOST, command)
-            if p.returncode == 0:
-                applied.append(f"GPU {card.get('index')} = {watts} W")
-            else:
-                refused.append(f"GPU {card.get('index')}")
-                log.warning("power limits: GPU %s refused %s W: %s", card.get("index"), watts,
-                            (p.stderr or p.stdout or "").strip()[:120])
-        if applied:
-            log.info("power limits restored: %s", ", ".join(applied))
-            record_action("power limits restored: " + ", ".join(applied))
-        if refused:
-            record_action(f"power limits: {len(refused)} card(s) refused the saved value")
-        return
+        p = ssh(GPU_HOST, command)
+        if p.returncode == 0:
+            applied.append(f"GPU {card.get('index')} = {watts} W")
+        else:
+            refused.append(f"GPU {card.get('index')}")
+            # Tried again on the next attempt: a card the driver has not
+            # finished initialising refuses for a while, not forever.
+            left.append(key)
+            log.warning("power limits: GPU %s refused %s W: %s", card.get("index"), watts,
+                        (p.stderr or p.stdout or "").strip()[:120])
+    if applied:
+        log.info("power limits restored: %s", ", ".join(applied))
+        record_action("power limits restored: " + ", ".join(applied))
+    if refused:
+        record_action(f"power limits: {len(refused)} card(s) refused the saved value")
+    return left
 
 
 @app.post("/api/power")

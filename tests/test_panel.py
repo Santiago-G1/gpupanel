@@ -1333,3 +1333,88 @@ def test_a_stopped_comfyui_is_not_asked_twice_in_a_row(monkeypatch, tmp_path):
     assert len(calls) == 1
     assert panel.comfy_state(force=True) == "created"
     assert len(calls) == 2
+
+
+
+# --- the boot-time restore --------------------------------------------------
+def test_the_restore_waits_for_the_cards_to_appear(panel):
+    # The 250 W bug: the driver is still loading, the probe answers with no
+    # cards, and the restore used to read that as "nothing to do" and return.
+    seen = []
+
+    def gpu_status():
+        seen.append(1)
+        return {"gpus": [] if len(seen) == 1 else [card(index="0", power_limit="250.00")]}
+
+    panel.gpu_status = gpu_status
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+    panel.state["power_limits"] = {"index:0": 175}
+
+    panel.restore_power_limits(attempts=3, delay=0)
+
+    assert calls == ["nvidia-smi -i 0 -pl 175"]
+    assert panel.state["last_action"] == "power limits restored: GPU 0 = 175 W"
+
+
+def test_a_saved_key_that_matches_no_card_yet_is_retried(panel):
+    # A uuid the driver has not published yet is a card that is late, not a
+    # saved limit to drop: keying by index alone lost it for good.
+    seen = []
+
+    def gpu_status():
+        seen.append(1)
+        late = [card(index="7", uuid="GPU-late", power_limit="250.00")]
+        return {"gpus": late if len(seen) > 1 else [card(index="0", power_limit="250.00")]}
+
+    panel.gpu_status = gpu_status
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+    panel.state["power_limits"] = {"uuid:GPU-late": 175}
+
+    panel.restore_power_limits(attempts=3, delay=0)
+
+    assert calls == ["nvidia-smi -i 7 -pl 175"]
+
+
+def test_a_limit_that_never_lands_is_named_not_forgotten(panel):
+    stub_gpu(panel, card(index="0", power_limit="250.00"))
+    panel.ssh = lambda host, command, timeout=30: Proc(returncode=1, stderr="not supported")
+    panel.state["power_limits"] = {"index:0": 175}
+
+    panel.restore_power_limits(attempts=2, delay=0)
+
+    # The last word is the count that did not make it, not silence.
+    assert panel.state["last_action"] == "power limits: 1 card(s) not applied"
+
+
+def test_a_saved_key_with_no_card_at_all_is_named(panel):
+    stub_gpu(panel, card(index="0", power_limit="175.00"))
+    panel.ssh = lambda host, command, timeout=30: Proc()
+    panel.state["power_limits"] = {"index:9": 150}
+
+    panel.restore_power_limits(attempts=2, delay=0)
+
+    assert panel.state["last_action"] == "power limits: 1 card(s) not applied"
+
+
+def test_the_restore_does_not_hold_the_power_lock_while_it_waits(panel, monkeypatch):
+    # POST /api/power blocks on POWER_LOCK: a host that takes two minutes to
+    # boot must not be part of that wait.
+    sleeps = []
+    monkeypatch.setattr(panel.time, "sleep", lambda seconds: sleeps.append(panel.POWER_LOCK.locked()))
+    seen = []
+
+    def gpu_status():
+        seen.append(1)
+        if len(seen) == 1:
+            raise panel.HTTPException(503, "not ready")
+        return {"gpus": [card(index="0", power_limit="250.00")]}
+
+    panel.gpu_status = gpu_status
+    panel.ssh = lambda host, command, timeout=30: Proc()
+    panel.state["power_limits"] = {"index:0": 150}
+
+    panel.restore_power_limits(attempts=2, delay=10)
+
+    assert sleeps == [False]
