@@ -10,7 +10,15 @@ services:
     # uvicorn is PID 1 and reaps nothing: `init` takes care of the ssh children.
     init: true
     ports:
-      - "${PUBLISH_PORT:?}:8099"
+      # PUBLISH_ADDR is where the panel is reachable from: 127.0.0.1 keeps it
+      # off the LAN behind a reverse proxy, 0.0.0.0 publishes it everywhere.
+      - "${PUBLISH_ADDR:-0.0.0.0}:${PUBLISH_PORT:?}:8099"
+    # Neither the panel nor ssh needs a capability, and nothing it runs may gain
+    # one. It still runs as root because the mounted key lives in /root/.ssh.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     environment:
       - TZ=${TZ:-Etc/UTC}
       # Required: where nvidia-smi answers, and the router that loads models.
