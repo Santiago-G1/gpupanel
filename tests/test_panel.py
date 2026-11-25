@@ -5,6 +5,7 @@ replaced by a stub, which is how a setup with two cards, none of the consumers,
 or a card that answers `N/A` can be exercised.
 """
 
+import asyncio
 import json
 import subprocess
 import threading
@@ -943,6 +944,28 @@ def test_state_path_without_a_directory(panel, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     panel.record_action("relative")
     assert json.loads((tmp_path / "auto.json").read_text())["last_action"] == "relative"
+
+
+def test_a_state_file_that_cannot_be_written_stops_the_panel(panel, tmp_path, monkeypatch):
+    # `save_state()` only logs, so a read-only mount would leave a panel that
+    # serves but forgets: the revoked nonces would die with the process and a
+    # cookie from a closed session would be accepted again.
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("")
+    monkeypatch.setattr(panel, "STATE_PATH", str(blocker / "auto.json"))
+
+    async def enter():
+        async with panel.lifespan(panel.app):
+            pass
+
+    with pytest.raises(RuntimeError, match="state file cannot be written"):
+        asyncio.run(enter())
+
+
+def test_the_startup_check_leaves_no_file_behind(panel, tmp_path):
+    panel.check_state_writable()
+    assert not (tmp_path / "auto.json.probe").exists()
+    assert not (tmp_path / "auto.json").exists()  # it checks, it does not write the state
 
 
 # --- validation -------------------------------------------------------------

@@ -337,6 +337,7 @@ llm_blocked = False
 async def lifespan(_app: FastAPI):
     """Load the saved settings and start the auto-switch tick."""
     load_state()
+    check_state_writable()
     threading.Thread(target=restore_power_limits, name="restore-power", daemon=True).start()
     task = asyncio.create_task(auto_loop())
     try:
@@ -425,6 +426,28 @@ def save_state():
             os.replace(tmp, STATE_PATH)
         except OSError as exc:
             log.warning("could not save %s: %s", STATE_PATH, exc)
+
+
+def check_state_writable():
+    """Refuse to start when the state file cannot be written.
+
+    `save_state()` only logs, which is right for one failed save and wrong for
+    a read-only mount: the panel would keep answering, the revoked nonces would
+    die with the process, and a cookie from a closed session would be accepted
+    again after a restart. A probe file is what tests the same thing the save
+    needs — a writable directory to create and rename in.
+    """
+    parent = os.path.dirname(STATE_PATH) or "."
+    probe = f"{STATE_PATH}.probe"
+    try:
+        os.makedirs(parent, exist_ok=True)
+        with open(probe, "w") as fh:
+            fh.write("")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.unlink(probe)
+    except OSError as exc:
+        raise RuntimeError(f"the state file cannot be written: {STATE_PATH}: {exc}") from exc
 
 
 # --- auth: login page -> signed session cookie; bearer token for automation ---
