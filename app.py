@@ -551,6 +551,19 @@ def ssh(host, command, timeout=30):
     return run(["ssh", *SSH_OPTS, host, command], timeout)
 
 
+def ssh_failure(p, message):
+    """A short 502 for the browser, with the reason only in the log.
+
+    The stderr of an SSH round trip carries the key path, the host name and
+    whatever the remote tool printed. None of that belongs in a response body:
+    the operator has `docker logs`, the page gets one sentence.
+    """
+    detail = (p.stderr or p.stdout or "").strip()
+    if detail:
+        log.warning("%s: %s", message, detail[:500])
+    return HTTPException(502, message)
+
+
 def ai_cmd(command):
     """A command where llama.cpp and ComfyUI live: on AI_HOST, or in its CT."""
     return f"pct exec {AI_CTID} -- {command}" if AI_CTID else command
@@ -902,7 +915,7 @@ def llama_logs(lines=200):
         timeout=25,
     )
     if p.returncode != 0:
-        raise HTTPException(502, (p.stderr or p.stdout).strip() or "journalctl failed")
+        raise ssh_failure(p, "could not read the llama.cpp log")
     return [line for line in p.stdout.splitlines() if line.strip()]
 
 
@@ -940,7 +953,9 @@ def models_on_disk():
     # says so on stderr and exits non-zero, but what it printed is a listing.
     if p.returncode != 0:
         if not rows:
-            raise RuntimeError((p.stderr or p.stdout).strip() or "find failed")
+            log.warning("models folder: could not read %s: %s", LLAMA_MODELS_DIR,
+                        (p.stderr or p.stdout).strip()[:500])
+            raise RuntimeError("could not read the models folder")
         log.debug("find -L %s exited %s: %s", LLAMA_MODELS_DIR, p.returncode,
                   (p.stderr or p.stdout).strip())
     return sorted(models, key=lambda m: m["id"])
@@ -1040,7 +1055,7 @@ def comfy(action):
         return {"action": action, "skipped": "ComfyUI is not configured"}
     p = ssh(AI_HOST, ai_cmd(f"docker {action} {COMFY_CONTAINER}"), timeout=90)
     if p.returncode != 0:
-        raise HTTPException(502, p.stderr.strip() or p.stdout.strip())
+        raise ssh_failure(p, f"ComfyUI did not {action}")
     # The remembered state is now wrong on purpose: ask again.
     comfy_state(force=True)
     return {"action": action, "ok": True}
@@ -1102,7 +1117,7 @@ def immich_ml(action):
     # grace period, and the default thirty gave up in the middle of it.
     p = ssh(IMMICH_HOST, f"docker {action} {IMMICH_ML_CONTAINER}", timeout=90)
     if p.returncode != 0:
-        raise HTTPException(502, p.stderr.strip() or p.stdout.strip())
+        raise ssh_failure(p, f"Immich ML did not {action}")
     return {"action": action, "ok": True}
 
 
@@ -1137,7 +1152,9 @@ def immich_transcode():
     try:
         return json.loads(p.stdout).get("ffmpeg", {})
     except Exception:
-        return {"error": (p.stdout or p.stderr).strip()[:200]}
+        log.warning("Immich: could not read its ffmpeg settings: %s",
+                    (p.stdout or p.stderr).strip()[:200])
+        return {"error": "could not read Immich's settings"}
 
 
 def jellyfin_accel():
@@ -1176,7 +1193,7 @@ def jellyfin_set_accel(accel):
     )
     p = ssh_script(JELLYFIN_HOST, script)
     if p.returncode != 0:
-        raise HTTPException(502, p.stderr.strip() or p.stdout.strip())
+        raise ssh_failure(p, "could not change Jellyfin's accelerator")
     return {"accel": accel}
 
 

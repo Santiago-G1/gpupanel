@@ -7,6 +7,8 @@ or a card that answers `N/A` can be exercised.
 
 import json
 import subprocess
+import threading
+import time
 import types
 
 import pytest
@@ -679,11 +681,12 @@ def test_a_missing_folder_is_an_error_in_the_answer(monkeypatch, tmp_path):
     panel.ssh = fake_ssh
     # Non-zero with nothing on stdout is the one failure that is still an error:
     # with rows, the listing wins (see test_a_failing_find_still_returns_what_it_printed).
-    with pytest.raises(RuntimeError, match="No such file"):
+    with pytest.raises(RuntimeError, match="models folder"):
         panel.models_on_disk()
 
     status = panel.status("t")
-    assert status["disk_models"] == {"error": "find: '/mnt/nope': No such file or directory"}
+    # What SSH said about the folder stays in the log: the page gets a sentence.
+    assert status["disk_models"] == {"error": "could not read the models folder"}
 
 
 def test_the_folder_and_the_router_are_crossed(panel):
@@ -1539,3 +1542,17 @@ def test_a_jellyfin_that_is_already_up_is_left_alone(monkeypatch, tmp_path):
 
     assert panel.jellyfin_ensure_accel("nvenc") == {"accel": "nvenc", "already": True}
     assert len(calls) == 1 and "docker inspect" in calls[0]
+
+
+# --- what the page is told when SSH fails -----------------------------------
+def test_a_failed_ssh_keeps_its_reason_out_of_the_response(panel, caplog):
+    panel.ssh = lambda host, command, timeout=30: Proc(
+        returncode=255, stderr="/root/.ssh/id_ed25519: Permission denied (publickey)")
+
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.llama_logs(50)
+
+    assert exc.value.status_code == 502
+    assert exc.value.detail == "could not read the llama.cpp log"
+    # The detail is not lost: it is in the log, where it is not a public answer.
+    assert "/root/.ssh" in caplog.text
