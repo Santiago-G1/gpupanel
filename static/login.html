@@ -82,7 +82,16 @@ form.addEventListener('submit', async (ev) => {
       return;
     }
     const next = new URLSearchParams(location.search).get('next');
-    location.replace(next && next.startsWith('/') && !next.startsWith('//') ? next : '/');
+    // Only this origin: `next=/\evil.com` starts with a slash and still lands
+    // somewhere else, so the check is on the parsed origin, not on the text.
+    let target = '/';
+    if (next) {
+      try {
+        const url = new URL(next, location.origin);
+        if (url.origin === location.origin) target = url.pathname + url.search + url.hash;
+      } catch (e) {}
+    }
+    location.replace(target);
   } catch (e) {
     fail('Could not reach the panel: ' + e.message);
   } finally {

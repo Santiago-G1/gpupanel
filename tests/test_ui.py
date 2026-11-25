@@ -88,3 +88,11 @@ def test_the_inline_javascript_parses(tmp_path):
     script_path.write_text("\n".join(re.findall(r"<script>(.*?)</script>", html, re.S)))
     result = subprocess.run(["node", "--check", str(script_path)], text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_the_login_page_only_sends_you_back_to_this_origin():
+    # `next=/\\evil.com` starts with a single slash and still leaves the origin:
+    # the check has to be on the parsed URL, not on its first characters.
+    html = (STATIC / "login.html").read_text()
+    assert "new URL(next, location.origin)" in html
+    assert "url.origin === location.origin" in html
