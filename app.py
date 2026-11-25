@@ -1098,7 +1098,9 @@ def comfy_stats():
 def immich_ml(action):
     if not IMMICH:
         return {"action": action, "skipped": "Immich is not configured"}
-    p = ssh(IMMICH_HOST, f"docker {action} {IMMICH_ML_CONTAINER}")
+    # Ninety seconds, like ComfyUI: `docker stop` waits out the container's own
+    # grace period, and the default thirty gave up in the middle of it.
+    p = ssh(IMMICH_HOST, f"docker {action} {IMMICH_ML_CONTAINER}", timeout=90)
     if p.returncode != 0:
         raise HTTPException(502, p.stderr.strip() or p.stdout.strip())
     return {"action": action, "ok": True}
