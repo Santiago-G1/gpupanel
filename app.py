@@ -1286,94 +1286,95 @@ def track_gpus(gpus):
     with the kernel lines that go with it.
 
     The first observation after a fresh state file is the baseline, not news.
+    The whole read-decide-write runs under STATE_LOCK: `/api/status` and the
+    20-second tick both call this, and two of them reading `gpus_known` at
+    once recorded the same change twice.
     """
-    keys = [card_key(card) for card in gpus]
-    meta = {
-        card_key(card): {
-            "name": card.get("name") or "GPU",
-            "pci": card.get("pci") or "",
-            "uuid": str(card.get("uuid") or ""),
-            "vendor": card.get("vendor") or "",
+    with STATE_LOCK:
+        keys = [card_key(card) for card in gpus]
+        meta = {
+            card_key(card): {
+                "name": card.get("name") or "GPU",
+                "pci": card.get("pci") or "",
+                "uuid": str(card.get("uuid") or ""),
+                "vendor": card.get("vendor") or "",
+            }
+            for card in gpus
         }
-        for card in gpus
-    }
-    aers = {card_key(card): card.get("aer") for card in gpus if card.get("aer")}
-    if aers:
-        state["gpus_aer"] = {**(state.get("gpus_aer") or {}), **aers}
+        aers = {card_key(card): card.get("aer") for card in gpus if card.get("aer")}
+        if aers:
+            state["gpus_aer"] = {**(state.get("gpus_aer") or {}), **aers}
 
-    known = state.get("gpus_known")
-    if known is None:
-        with STATE_LOCK:
+        known = state.get("gpus_known")
+        if known is None:
             state["gpus_known"] = keys
             state["gpus_names"] = meta
             state["gpus_down"] = {}
             state["gpus_blind"] = sorted(k for k, v in zip(keys, gpus, strict=True) if v.get("driver_visible") is False)
-        save_state()
-        return
+            save_state()
+            return
 
-    at = time.strftime("%Y-%m-%d %H:%M:%S")
-    now = time.time()
-    seen = {key: _meta(key, value) for key, value in (state.get("gpus_names") or {}).items()}
+        at = time.strftime("%Y-%m-%d %H:%M:%S")
+        now = time.time()
+        seen = {key: _meta(key, value) for key, value in (state.get("gpus_names") or {}).items()}
 
-    added = [card for card in gpus if card_key(card) not in known]
-    removed = [key for key in known if key not in keys]
-    blind_now = sorted(card_key(card) for card in gpus if card.get("driver_visible") is False)
-    blind_before = sorted(state.get("gpus_blind") or [])
-    went_blind = [key for key in blind_now if key not in blind_before]
-    came_back = [key for key in blind_before if key not in blind_now and key in keys]
-    with STATE_LOCK:
+        added = [card for card in gpus if card_key(card) not in known]
+        removed = [key for key in known if key not in keys]
+        blind_now = sorted(card_key(card) for card in gpus if card.get("driver_visible") is False)
+        blind_before = sorted(state.get("gpus_blind") or [])
+        went_blind = [key for key in blind_now if key not in blind_before]
+        came_back = [key for key in blind_before if key not in blind_now and key in keys]
         state["gpus_blind"] = blind_now
-    if not (added or removed or went_blind or came_back):
-        # Same cards, maybe reported in another order: not a change.
-        return
+        if not (added or removed or went_blind or came_back):
+            # Same cards, maybe reported in another order: not a change.
+            return
 
-    evidence = gpu_evidence()
-    events = []
-    down = dict(state.get("gpus_down") or {})
-    for key in removed:
-        info = seen.get(key) or _meta(key, "GPU")
-        previous = down.get(key) or {}
-        down[key] = {
-            "key": key,
-            "uuid": info.get("uuid") or "",
-            "pci": info.get("pci") or "",
-            "name": info.get("name") or "GPU",
-            "vendor": info.get("vendor") or "",
-            # `since` survives the event history, so a card that stays gone
-            # says for how long instead of only when it was noticed.
-            "since": previous.get("since") or at,
-            "since_ts": previous.get("since_ts") or now,
-            "lost": int(previous.get("lost") or 0) + 1,
-            "aer": previous.get("aer") or (state.get("gpus_aer") or {}).get(key),
-        }
-        events.append({**{k: down[key][k] for k in ("key", "uuid", "pci", "name", "vendor")},
-                       "at": at, "ts": now, "kind": "removed", "count": len(keys), "evidence": evidence})
-    for card in added:
-        key = card_key(card)
-        down.pop(key, None)
-        events.append({
-            "at": at, "ts": now, "kind": "added", "key": key, "uuid": str(card.get("uuid") or ""),
-            "pci": card.get("pci") or "", "name": card.get("name") or "GPU",
-            "vendor": card.get("vendor") or "", "count": len(keys),
-            "evidence": evidence if removed else None,
-        })
-    for key in went_blind:
-        info = meta.get(key) or seen.get(key) or _meta(key, "GPU")
-        events.append({"at": at, "ts": now, "kind": "blind", "key": key, "uuid": info.get("uuid") or "",
-                       "pci": info.get("pci") or "", "name": info.get("name") or "GPU",
-                       "vendor": info.get("vendor") or "", "count": len(keys), "evidence": evidence})
-    for key in came_back:
-        info = meta.get(key) or seen.get(key) or _meta(key, "GPU")
-        down.pop(key, None)
-        events.append({"at": at, "ts": now, "kind": "visible", "key": key, "uuid": info.get("uuid") or "",
-                       "pci": info.get("pci") or "", "name": info.get("name") or "GPU",
-                       "vendor": info.get("vendor") or "", "count": len(keys)})
+        evidence = gpu_evidence()
+        events = []
+        down = dict(state.get("gpus_down") or {})
+        for key in removed:
+            info = seen.get(key) or _meta(key, "GPU")
+            previous = down.get(key) or {}
+            down[key] = {
+                "key": key,
+                "uuid": info.get("uuid") or "",
+                "pci": info.get("pci") or "",
+                "name": info.get("name") or "GPU",
+                "vendor": info.get("vendor") or "",
+                # `since` survives the event history, so a card that stays gone
+                # says for how long instead of only when it was noticed.
+                "since": previous.get("since") or at,
+                "since_ts": previous.get("since_ts") or now,
+                "lost": int(previous.get("lost") or 0) + 1,
+                "aer": previous.get("aer") or (state.get("gpus_aer") or {}).get(key),
+            }
+            events.append({**{k: down[key][k] for k in ("key", "uuid", "pci", "name", "vendor")},
+                           "at": at, "ts": now, "kind": "removed", "count": len(keys), "evidence": evidence})
+        for card in added:
+            key = card_key(card)
+            down.pop(key, None)
+            events.append({
+                "at": at, "ts": now, "kind": "added", "key": key, "uuid": str(card.get("uuid") or ""),
+                "pci": card.get("pci") or "", "name": card.get("name") or "GPU",
+                "vendor": card.get("vendor") or "", "count": len(keys),
+                "evidence": evidence if removed else None,
+            })
+        for key in went_blind:
+            info = meta.get(key) or seen.get(key) or _meta(key, "GPU")
+            events.append({"at": at, "ts": now, "kind": "blind", "key": key, "uuid": info.get("uuid") or "",
+                           "pci": info.get("pci") or "", "name": info.get("name") or "GPU",
+                           "vendor": info.get("vendor") or "", "count": len(keys), "evidence": evidence})
+        for key in came_back:
+            info = meta.get(key) or seen.get(key) or _meta(key, "GPU")
+            down.pop(key, None)
+            events.append({"at": at, "ts": now, "kind": "visible", "key": key, "uuid": info.get("uuid") or "",
+                           "pci": info.get("pci") or "", "name": info.get("name") or "GPU",
+                           "vendor": info.get("vendor") or "", "count": len(keys)})
 
-    def listed(kind):
-        return [{"key": e["key"], "uuid": e["uuid"], "name": e["name"], "pci": e["pci"]}
-                for e in events if e["kind"] == kind]
+        def listed(kind):
+            return [{"key": e["key"], "uuid": e["uuid"], "name": e["name"], "pci": e["pci"]}
+                    for e in events if e["kind"] == kind]
 
-    with STATE_LOCK:
         state["gpus_known"] = keys
         # A card that is gone keeps its name, which is what makes the next
         # "lost" message readable.
@@ -1387,17 +1388,17 @@ def track_gpus(gpus):
             "removed": listed("removed"),
         }
 
-    def label(cards):
-        return ", ".join(f"{card['name']} ({_short(card['key'])})" for card in cards)
+        def label(cards):
+            return ", ".join(f"{card['name']} ({_short(card['key'])})" for card in cards)
 
-    parts = []
-    if added:
-        parts.append(f"{len(added)} new GPU: {label(listed('added'))}")
-    if removed:
-        parts.append(f"{len(removed)} GPU lost: {label(listed('removed'))}")
-    if went_blind:
-        parts.append(f"{len(went_blind)} GPU on the bus but not in the driver: {label(listed('blind'))}")
-    record_action(f"cards changed (now {len(keys)}): {'; '.join(parts)}")
+        parts = []
+        if added:
+            parts.append(f"{len(added)} new GPU: {label(listed('added'))}")
+        if removed:
+            parts.append(f"{len(removed)} GPU lost: {label(listed('removed'))}")
+        if went_blind:
+            parts.append(f"{len(went_blind)} GPU on the bus but not in the driver: {label(listed('blind'))}")
+        record_action(f"cards changed (now {len(keys)}): {'; '.join(parts)}")
 
 
 def inventory_view(gpus, probe=None):

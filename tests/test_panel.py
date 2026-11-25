@@ -7,6 +7,7 @@ or a card that answers `N/A` can be exercised.
 
 import json
 import subprocess
+import threading
 import types
 
 import pytest
@@ -1472,3 +1473,29 @@ def test_a_comfyui_that_would_not_stop_is_not_a_free_card(monkeypatch, tmp_path)
     # card that was never freed.
     assert panel.llm_blocked is False
     assert panel.state["last_action"] == "LLM in use: ComfyUI still on the card, retrying"
+
+
+# --- the inventory is one locked read-modify-write --------------------------
+def test_the_inventory_is_read_and_written_under_one_lock(panel):
+    # /api/status and the 20-second tick both call track_gpus: two of them
+    # reading gpus_known before either wrote it recorded the same change twice.
+    acquired = []
+
+    def evidence():
+        def try_lock():
+            got = panel.STATE_LOCK.acquire(timeout=0.2)
+            acquired.append(got)
+            if got:
+                panel.STATE_LOCK.release()
+
+        thread = threading.Thread(target=try_lock)
+        thread.start()
+        thread.join()
+        return []
+
+    panel.gpu_evidence = evidence
+    board = [{"uuid": "GPU-aaaa-1111", "name": "Card A", "index": "0"}]
+    panel.track_gpus(board)  # the baseline
+    panel.track_gpus([])  # a change: the evidence runs inside the lock
+
+    assert acquired == [False]
