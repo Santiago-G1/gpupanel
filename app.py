@@ -1356,6 +1356,24 @@ def gpu_evidence():
     return [line.strip() for line in (p.stdout or "").splitlines() if line.strip()][-20:]
 
 
+def card_changes(gpus, keys):
+    """What differs from the last observation, read against the state as it is.
+
+    Called twice around the one SSH in `track_gpus`: the second reading sees
+    whatever the other caller recorded meanwhile, and finds nothing left to do.
+    """
+    known = state.get("gpus_known") or []
+    blind_now = sorted(card_key(card) for card in gpus if card.get("driver_visible") is False)
+    blind_before = sorted(state.get("gpus_blind") or [])
+    return {
+        "added": [card for card in gpus if card_key(card) not in known],
+        "removed": [key for key in known if key not in keys],
+        "blind_now": blind_now,
+        "went_blind": [key for key in blind_now if key not in blind_before],
+        "came_back": [key for key in blind_before if key not in blind_now and key in keys],
+    }
+
+
 def track_gpus(gpus):
     """Remember the card set, and record the moment it changes.
 
@@ -1366,27 +1384,29 @@ def track_gpus(gpus):
     with the kernel lines that go with it.
 
     The first observation after a fresh state file is the baseline, not news.
-    The whole read-decide-write runs under STATE_LOCK: `/api/status` and the
+    The read-decide-write runs under STATE_LOCK: `/api/status` and the
     20-second tick both call this, and two of them reading `gpus_known` at
-    once recorded the same change twice.
+    once recorded the same change twice. The kernel evidence is the exception:
+    that SSH is a 20 s timeout, and a card going and coming back must not hold
+    `save_state()` — and with it every endpoint that takes the lock — for it.
     """
-    with STATE_LOCK:
-        keys = [card_key(card) for card in gpus]
-        meta = {
-            card_key(card): {
-                "name": card.get("name") or "GPU",
-                "pci": card.get("pci") or "",
-                "uuid": str(card.get("uuid") or ""),
-                "vendor": card.get("vendor") or "",
-            }
-            for card in gpus
+    keys = [card_key(card) for card in gpus]
+    meta = {
+        card_key(card): {
+            "name": card.get("name") or "GPU",
+            "pci": card.get("pci") or "",
+            "uuid": str(card.get("uuid") or ""),
+            "vendor": card.get("vendor") or "",
         }
-        aers = {card_key(card): card.get("aer") for card in gpus if card.get("aer")}
+        for card in gpus
+    }
+    aers = {card_key(card): card.get("aer") for card in gpus if card.get("aer")}
+
+    with STATE_LOCK:
         if aers:
             state["gpus_aer"] = {**(state.get("gpus_aer") or {}), **aers}
 
-        known = state.get("gpus_known")
-        if known is None:
+        if state.get("gpus_known") is None:
             state["gpus_known"] = keys
             state["gpus_names"] = meta
             state["gpus_down"] = {}
@@ -1394,22 +1414,26 @@ def track_gpus(gpus):
             save_state()
             return
 
-        at = time.strftime("%Y-%m-%d %H:%M:%S")
-        now = time.time()
-        seen = {key: _meta(key, value) for key, value in (state.get("gpus_names") or {}).items()}
-
-        added = [card for card in gpus if card_key(card) not in known]
-        removed = [key for key in known if key not in keys]
-        blind_now = sorted(card_key(card) for card in gpus if card.get("driver_visible") is False)
-        blind_before = sorted(state.get("gpus_blind") or [])
-        went_blind = [key for key in blind_now if key not in blind_before]
-        came_back = [key for key in blind_before if key not in blind_now and key in keys]
-        state["gpus_blind"] = blind_now
-        if not (added or removed or went_blind or came_back):
+        changes = card_changes(gpus, keys)
+        if not any(changes[key] for key in ("added", "removed", "went_blind", "came_back")):
             # Same cards, maybe reported in another order: not a change.
             return
 
-        evidence = gpu_evidence()
+    evidence = gpu_evidence()
+
+    with STATE_LOCK:
+        # The other caller may have recorded this change while the SSH ran.
+        changes = card_changes(gpus, keys)
+        added, removed = changes["added"], changes["removed"]
+        went_blind, came_back = changes["went_blind"], changes["came_back"]
+        if not (added or removed or went_blind or came_back):
+            return
+        # Written here, not before the SSH: it is what "went blind" is measured
+        # against, and the other caller may have recorded this change already.
+        state["gpus_blind"] = changes["blind_now"]
+        at = time.strftime("%Y-%m-%d %H:%M:%S")
+        now = time.time()
+        seen = {key: _meta(key, value) for key, value in (state.get("gpus_names") or {}).items()}
         events = []
         down = dict(state.get("gpus_down") or {})
         for key in removed:

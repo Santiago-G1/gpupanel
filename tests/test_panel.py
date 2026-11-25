@@ -1510,10 +1510,11 @@ def test_a_comfyui_that_would_not_stop_is_not_a_free_card(monkeypatch, tmp_path)
     assert panel.state["last_action"] == "LLM in use: ComfyUI still on the card, retrying"
 
 
-# --- the inventory is one locked read-modify-write --------------------------
-def test_the_inventory_is_read_and_written_under_one_lock(panel):
-    # /api/status and the 20-second tick both call track_gpus: two of them
-    # reading gpus_known before either wrote it recorded the same change twice.
+# --- the inventory, the lock, and the one SSH it makes ----------------------
+def test_the_card_evidence_is_gathered_outside_the_state_lock(panel):
+    # `save_state()` waits on STATE_LOCK, and with it /api/logout, /api/power
+    # and /api/auto: a card that is flapping must not block them for the 20 s
+    # the evidence SSH is allowed to take.
     acquired = []
 
     def evidence():
@@ -1531,9 +1532,29 @@ def test_the_inventory_is_read_and_written_under_one_lock(panel):
     panel.gpu_evidence = evidence
     board = [{"uuid": "GPU-aaaa-1111", "name": "Card A", "index": "0"}]
     panel.track_gpus(board)  # the baseline
-    panel.track_gpus([])  # a change: the evidence runs inside the lock
+    panel.track_gpus([])  # a change: the evidence runs with the lock free
 
-    assert acquired == [False]
+    assert acquired == [True]
+
+
+def test_a_change_that_two_callers_see_is_recorded_once(panel):
+    # The evidence runs outside the lock, so the other caller can record the
+    # change while this one is still waiting on its SSH: the second look has to
+    # find nothing left to write instead of a duplicate event.
+    board = [{"uuid": "GPU-aaaa-1111", "name": "Card A", "index": "0"}]
+    panel.track_gpus(board)  # the baseline
+    calls = []
+
+    def evidence():
+        if not calls:
+            calls.append("first")
+            panel.track_gpus([])  # the 20-second tick, in the middle of the SSH
+        return []
+
+    panel.gpu_evidence = evidence
+    panel.track_gpus([])
+
+    assert [event["kind"] for event in panel.state["gpus_events"]] == ["removed"]
 
 
 # --- Jellyfin left stopped ------------------------------------------------
