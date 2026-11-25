@@ -152,7 +152,7 @@ file, so a card that changed owner overnight can be explained afterwards.
 | `static/howto.html` | The guide served at `/howto`, same auth. |
 | `static/login.html` | The only page without a session, with its CSS inline so it loads unauthenticated. |
 | `static/panel.css` | Shared by the dashboard and the guide. |
-| `docker-compose.yml` | The stack: build, published port, SSH key, state volume, health check. |
+| `docker-compose.yml` | The stack: build, published address and port, SSH key, the `./state` bind mount, log rotation, health check. |
 | `.env.template` | Every variable the Compose file reads. Never a real secret. |
 | `LICENSE` | MIT: use it, fork it, keep the notice. |
 | `tests/` | `pytest` suite: the panel's promises, with the probes replaced by stubs. |
@@ -352,7 +352,7 @@ them as models. The dashboard marks a row `●` loaded (which includes
 | `LOGIN_DELAY` | `0.4` | Seconds burned on a bad password. |
 | `LOGIN_MAX_FAILURES` | `5` | Failed logins from one address before the answer is `429`. `0` disables it. |
 | `LOGIN_WINDOW` | `300` | Seconds the failures are counted over. |
-| `STATE_PATH` | `/state/auto.json` | Inside the named volume. |
+| `STATE_PATH` | `/state/auto.json` | Inside the container; the Compose file bind-mounts `./state` there. |
 | `AI_HOST` | `GPU_HOST` | Where llama.cpp and ComfyUI run. |
 | `AI_CTID` | empty | Proxmox VM/CT id: commands run through `pct exec` there. Empty = on the host itself. |
 | `LLAMA_LOG_UNIT` | `llama-server` | The systemd unit whose journal is shown. |
@@ -375,6 +375,16 @@ them as models. The dashboard marks a row `●` loaded (which includes
 | `COMFY_CONTAINER` | empty | Empty = no start/stop control. |
 | `COMFY_URL` | empty | Its API, for the queue depth and the VRAM it sees. |
 | `COMFY_UI_URL` | empty | Link out to its web UI. |
+
+The Compose file itself reads four variables that `app.py` never sees:
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `PUBLISH_ADDR` | `0.0.0.0` | Address the port is published on. `127.0.0.1` keeps the panel off the LAN, which is what you want behind a reverse proxy. |
+| `PUBLISH_PORT` | — | **Required.** Host port mapped to the container's 8099. |
+| `SSH_PATH` | `/root/.ssh` | Directory mounted read-only as the container's `/root/.ssh`. The container runs as root for this mount alone. |
+| `TZ` | `Etc/UTC` | |
+
 
 `LLAMA_PUBLIC_MODELS` is the only display filter: unlisted models still load and
 unload through the panel, they are just never printed — a count stands in for
@@ -419,7 +429,8 @@ four probes do properly.
 
 ## State
 
-`/state/auto.json`, in the `gpu_panel_state` volume, holds what has to survive a
+`/state/auto.json` — `./state` on the host, bind-mounted so it is visible and
+backupable — holds what has to survive a
 recreate: the auto-switch settings, the power limit of each card (re-applied on
 start), the last action and when it happened, the
 revoked session nonces (sessions are stateless, so a logout has to remember one),
