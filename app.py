@@ -777,6 +777,13 @@ def power_command(card, watts):
     return None
 
 
+# The last card probe, read by /api/health: the healthcheck runs every 30 s and
+# must not spend an SSH round trip of its own on every tick.
+PROBE_STATE = {"at": 0.0, "ok": False, "cards": 0}
+# Older than this and the panel has not seen the host for six ticks: not healthy.
+HEALTH_PROBE_MAX_AGE = 120
+
+
 def probe_cards():
     """Every card, or why there are none. This one does not raise.
 
@@ -789,22 +796,28 @@ def probe_cards():
     text = p.stdout or ""
     if "@@end" not in text:
         detail = (p.stderr or p.stdout or "").strip().splitlines()
-        return {
+        probe = {
             "host_ok": False,
             "cards": [],
             "errors": [detail[-1][:300]] if detail else [f"the probe returned nothing (exit {p.returncode})"],
             "tools": {},
             "rc": {},
         }
-    sections = parse_probe(text)
-    cards, errors = build_cards(sections)
-    return {
-        "host_ok": True,
-        "cards": cards,
-        "errors": errors,
-        "tools": sections["tools"],
-        "rc": sections["rc"],
-    }
+    else:
+        sections = parse_probe(text)
+        cards, errors = build_cards(sections)
+        probe = {
+            "host_ok": True,
+            "cards": cards,
+            "errors": errors,
+            "tools": sections["tools"],
+            "rc": sections["rc"],
+        }
+    # Only a probe that reached the host counts: a host that is rebooting has to
+    # turn the container unhealthy instead of leaving the last good answer in
+    # place forever.
+    PROBE_STATE.update({"at": time.time(), "ok": probe["host_ok"], "cards": len(probe["cards"])})
+    return probe
 
 
 def probe_view(probe):
@@ -1650,6 +1663,29 @@ def session_info(request: Request):
         return {"authenticated": True, "user": "token", "mode": "token"}
     user = read_session(request)
     return {"authenticated": bool(user), "user": user or None, "mode": "session" if user else None}
+
+
+@app.get("/api/health")
+def health():
+    """Whether the panel can still see the machine, and no SSH to find out.
+
+    `/api/session` only said that uvicorn answered. What matters is whether the
+    card host is readable, and the 20-second tick already collects that: this
+    reads the last answer back. A probe that never reached the host, or one
+    older than HEALTH_PROBE_MAX_AGE, is a 503 — the dashboard would be showing
+    readings it can no longer refresh.
+    """
+    age = time.time() - PROBE_STATE["at"]
+    fresh = bool(PROBE_STATE["ok"]) and age < HEALTH_PROBE_MAX_AGE
+    return JSONResponse(
+        {
+            "ok": fresh,
+            "probe_ok": bool(PROBE_STATE["ok"]),
+            "probe_age": int(age),
+            "cards": PROBE_STATE["cards"],
+        },
+        status_code=200 if fresh else 503,
+    )
 
 
 # --- api ---

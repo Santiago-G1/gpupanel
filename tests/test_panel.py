@@ -7,6 +7,7 @@ or a card that answers `N/A` can be exercised.
 
 import json
 import subprocess
+import time
 import types
 
 import pytest
@@ -1418,3 +1419,34 @@ def test_the_restore_does_not_hold_the_power_lock_while_it_waits(panel, monkeypa
     panel.restore_power_limits(attempts=2, delay=10)
 
     assert sleeps == [False]
+
+
+# --- /api/health ------------------------------------------------------------
+def test_health_is_the_last_card_probe(panel):
+    # Nothing probed yet: the old /api/session answered 200 here, when the panel
+    # could not see the machine at all.
+    assert panel.health().status_code == 503
+
+    stub_probe(panel, gpu_lines=[nvidia_row()])
+    panel.gpu_status()
+
+    response = panel.health()
+    body = json.loads(response.body)
+    assert response.status_code == 200
+    assert (body["ok"], body["probe_ok"], body["cards"]) == (True, True, 1)
+    assert body["probe_age"] < 5
+
+
+def test_health_is_503_when_the_probe_could_not_reach_the_host(panel):
+    panel.ssh_script = lambda host, script, timeout=60: Proc(returncode=255, stderr="ssh: connect: timed out")
+    panel.probe_cards()
+
+    assert panel.health().status_code == 503
+
+
+def test_health_goes_503_when_the_last_probe_is_stale(panel, monkeypatch):
+    stub_probe(panel, gpu_lines=[nvidia_row()])
+    panel.gpu_status()
+    monkeypatch.setitem(panel.PROBE_STATE, "at", time.time() - panel.HEALTH_PROBE_MAX_AGE - 1)
+
+    assert panel.health().status_code == 503

@@ -61,11 +61,15 @@ services:
         limits:
           cpus: "1"
           memory: 512M
-    # /api/session answers without credentials and never touches another host,
-    # which makes it the cheapest probe of the process itself.
+    # /api/health answers from the last card probe and never leaves the
+    # container: it says whether the panel can still see the GPU host. The
+    # address is the container's own, not 127.0.0.1, so it works with any
+    # network mode and fails if uvicorn only bound loopback.
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/api/session', timeout=5)"]
+      test: ["CMD", "python", "-c", "import socket, urllib.request; h = socket.gethostbyname(socket.gethostname()); urllib.request.urlopen(f'http://{h}:8099/api/health', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      # The first probe is one SSH to the GPU host, and the container often
+      # starts before that host has finished booting.
+      start_period: 30s

@@ -24,8 +24,10 @@ COPY app.py .
 COPY static ./static
 
 EXPOSE 8099
-# /api/session answers without credentials and never leaves the container.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/api/session', timeout=5)"]
+# /api/health answers from the last card probe, without an SSH of its own, so
+# this says whether the panel can still see the GPU host. The container's own
+# address, not 127.0.0.1: it also fails when uvicorn bound only loopback.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD ["python", "-c", "import socket, urllib.request; h = socket.gethostbyname(socket.gethostname()); urllib.request.urlopen(f'http://{h}:8099/api/health', timeout=5)"]
 
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8099"]
