@@ -459,7 +459,7 @@ def session_payload(request: Request) -> dict:
     if not body or not sig:
         return {}
     expected = _b64e(hmac.new(SESSION_KEY, body.encode(), hashlib.sha256).digest())
-    if not secrets.compare_digest(sig, expected):
+    if not same_text(sig, expected):
         return {}
     try:
         payload = json.loads(_b64d(body))
