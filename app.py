@@ -544,6 +544,10 @@ SSH_OPTS = [
     "-o", "ControlMaster=auto",
     "-o", "ControlPath=/tmp/gpu-panel-%C",
     "-o", "ControlPersist=60",
+    # A host that stops answering (reboot, kernel hang) must end the call, not
+    # leave a probe worker waiting for the TCP stack to notice.
+    "-o", "ServerAliveInterval=5",
+    "-o", "ServerAliveCountMax=3",
 ]
 
 
