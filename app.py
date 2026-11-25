@@ -442,8 +442,15 @@ def check_state_writable():
     `save_state()` only logs, which is right for one failed save and wrong for
     a read-only mount: the panel would keep answering, the revoked nonces would
     die with the process, and a cookie from a closed session would be accepted
-    again after a restart. A probe file is what tests the same thing the save
-    needs — a writable directory to create and rename in.
+    again after a restart. Two probes, because a save needs both: a file the
+    directory allows creating and renaming — which a read-only file mount does
+    not — and, when the state file already exists, a writable open of it, since
+    a `-v ./auto.json:/state/auto.json:ro` bind mount leaves the directory
+    writable and makes every later `os.replace()` fail.
+
+    What it cannot catch is a mount that is simply absent: Docker creates the
+    parent directory in the container's own layer, the checks pass, and the
+    state dies with the container.
     """
     parent = os.path.dirname(STATE_PATH) or "."
     probe = f"{STATE_PATH}.probe"
@@ -454,6 +461,10 @@ def check_state_writable():
             fh.flush()
             os.fsync(fh.fileno())
         os.unlink(probe)
+        if os.path.exists(STATE_PATH):
+            # No truncation: this only asks the kernel whether it would let the
+            # save write here. The state itself is left untouched.
+            os.close(os.open(STATE_PATH, os.O_WRONLY))
     except OSError as exc:
         raise RuntimeError(f"the state file cannot be written: {STATE_PATH}: {exc}") from exc
 

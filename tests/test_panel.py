@@ -968,6 +968,23 @@ def test_the_startup_check_leaves_no_file_behind(panel, tmp_path):
     assert not (tmp_path / "auto.json").exists()  # it checks, it does not write the state
 
 
+def test_a_state_file_that_only_opens_read_only_stops_the_panel(panel, tmp_path, monkeypatch):
+    # `-v ./auto.json:/state/auto.json:ro`: the directory takes the probe file
+    # and every later `os.replace()` fails, so the file is asked as well.
+    (tmp_path / "auto.json").write_text("{}")
+    real_open = panel.os.open
+
+    def read_only_file(path, flags, *args, **kwargs):
+        if str(path) == panel.STATE_PATH and flags & panel.os.O_WRONLY:
+            raise PermissionError(13, "Read-only file system")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(panel.os, "open", read_only_file)
+
+    with pytest.raises(RuntimeError, match="state file cannot be written"):
+        panel.check_state_writable()
+
+
 # --- validation -------------------------------------------------------------
 def test_auto_settings_are_validated(panel):
     with pytest.raises(panel.HTTPException) as exc:
