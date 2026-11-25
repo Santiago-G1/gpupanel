@@ -1556,3 +1556,29 @@ def test_a_failed_ssh_keeps_its_reason_out_of_the_response(panel, caplog):
     assert exc.value.detail == "could not read the llama.cpp log"
     # The detail is not lost: it is in the log, where it is not a public answer.
     assert "/root/.ssh" in caplog.text
+
+
+# --- the models folder is a cached reading ---------------------------------
+def test_the_models_folder_is_read_once_per_window(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, LLAMA_MODELS_DIR="/mnt/models")
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc("a.gguf\t1\t1\n")
+
+    assert panel.models_on_disk() == [{"id": "a", "size": 1, "mtime": 1}]
+    assert panel.models_on_disk() == [{"id": "a", "size": 1, "mtime": 1}]
+    assert len(calls) == 1  # /api/status polls every five seconds
+    assert panel.models_on_disk(force=True) == [{"id": "a", "size": 1, "mtime": 1}]
+    assert len(calls) == 2
+
+
+def test_a_folder_that_failed_is_not_remembered(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, LLAMA_MODELS_DIR="/mnt/models")
+    answers = [Proc(returncode=1, stderr="find: '/mnt/models': No such file or directory"),
+               Proc("a.gguf\t1\t1\n")]
+
+    panel.ssh = lambda host, command, timeout=30: answers.pop(0)
+
+    with pytest.raises(RuntimeError):
+        panel.models_on_disk()
+    # A folder that appears is seen on the next poll, not thirty seconds later.
+    assert panel.models_on_disk() == [{"id": "a", "size": 1, "mtime": 1}]

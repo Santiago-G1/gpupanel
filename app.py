@@ -919,12 +919,26 @@ def llama_logs(lines=200):
     return [line for line in p.stdout.splitlines() if line.strip()]
 
 
-def models_on_disk():
+# The models folder is an SSH round trip worth a full second, and the dashboard
+# polls /api/status every five. Same shape as COMFY_STATE: a value and when it
+# was read, and a caller that can force it.
+DISK_STATE_TTL = 30
+DISK_STATE = {"at": 0.0, "value": None}
+
+
+def models_on_disk(force=False):
     """The .gguf files in LLAMA_MODELS_DIR, as llama.cpp sees them.
 
     `-L` is what makes this useful: several models here are symlinks into the
     pool, and without it `%s` is the size of the link, not of the file.
+
+    One SSH round trip per cache window: /api/status is polled every five
+    seconds and this is a full second of it, while the folder changes at the
+    speed of a `cp`. Failures are not cached, so a folder that comes back is
+    seen on the next poll.
     """
+    if not force and DISK_STATE["value"] is not None and time.time() - DISK_STATE["at"] < DISK_STATE_TTL:
+        return DISK_STATE["value"]
     command = (
         f"find -L {shlex.quote(LLAMA_MODELS_DIR)} -maxdepth 1 -type f -name '*.gguf' "
         "-printf '%f\\t%s\\t%T@\\n'"
@@ -958,7 +972,9 @@ def models_on_disk():
             raise RuntimeError("could not read the models folder")
         log.debug("find -L %s exited %s: %s", LLAMA_MODELS_DIR, p.returncode,
                   (p.stderr or p.stdout).strip())
-    return sorted(models, key=lambda m: m["id"])
+    models.sort(key=lambda m: m["id"])
+    DISK_STATE.update({"at": time.time(), "value": models})
+    return models
 
 
 def public_model(model):
