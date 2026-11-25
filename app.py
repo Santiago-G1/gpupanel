@@ -347,7 +347,10 @@ async def lifespan(_app: FastAPI):
             await task
 
 
-app = FastAPI(title="GPU control panel", lifespan=lifespan)
+# No /docs, /redoc, /openapi.json: the schema names every endpoint and every
+# field, and it was served to anyone who asked for it.
+app = FastAPI(title="GPU control panel", lifespan=lifespan,
+              docs_url=None, redoc_url=None, openapi_url=None)
 # Shared by the dashboard and the guide.
 app.mount("/static", StaticFiles(directory=os.path.join(APP_DIR, "static")), name="static")
 

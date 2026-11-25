@@ -7,7 +7,6 @@ or a card that answers `N/A` can be exercised.
 
 import json
 import subprocess
-import time
 import types
 
 import pytest
@@ -1450,3 +1449,9 @@ def test_health_goes_503_when_the_last_probe_is_stale(panel, monkeypatch):
     monkeypatch.setitem(panel.PROBE_STATE, "at", time.time() - panel.HEALTH_PROBE_MAX_AGE - 1)
 
     assert panel.health().status_code == 503
+
+
+def test_the_schema_is_not_served(panel):
+    paths = {getattr(route, "path", "") for route in panel.app.routes}
+    assert not paths & {"/docs", "/redoc", "/openapi.json"}
+    assert (panel.app.docs_url, panel.app.redoc_url, panel.app.openapi_url) == (None, None, None)
