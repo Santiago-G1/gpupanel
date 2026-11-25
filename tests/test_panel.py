@@ -511,7 +511,7 @@ def test_power_is_applied_to_every_card(panel):
     assert [c["index"] for c in out["cards"]] == ["0", "1"]
 
 
-def test_a_card_that_refuses_the_limit_is_reported(panel):
+def test_a_card_that_refuses_the_limit_is_reported(panel, caplog):
     # Two different cards: the second one tops out below what was asked.
     stub_gpu(panel, card(index="0"), card(index="1", uuid="GPU-bbbb", power_max="200"))
 
@@ -525,7 +525,10 @@ def test_a_card_that_refuses_the_limit_is_reported(panel):
 
     assert out["ok"] is False
     assert out["cards"][0] == {"index": "0", "ok": True}
-    assert out["cards"][1]["error"].startswith("Setting power limit")
+    # One sentence for the page; the driver's own words carry the card's
+    # address, so they only go to the log.
+    assert out["cards"][1]["error"] == "the driver refused the limit"
+    assert "0000:02:00.0" in caplog.text
     assert "1 card(s) refused" in panel.state["last_action"]
 
 
@@ -535,7 +538,7 @@ def test_no_card_accepting_the_limit_is_a_502(panel):
     with pytest.raises(panel.HTTPException) as exc:
         panel.set_power({"watts": 200}, "t")
     assert exc.value.status_code == 502
-    assert exc.value.detail == "not supported"
+    assert exc.value.detail == "no card accepted the limit"
 
 
 def test_a_value_outside_every_range_is_refused_before_any_command(panel):
@@ -1561,6 +1564,19 @@ def test_a_failed_ssh_keeps_its_reason_out_of_the_response(panel, caplog):
     assert exc.value.detail == "could not read the llama.cpp log"
     # The detail is not lost: it is in the log, where it is not a public answer.
     assert "/root/.ssh" in caplog.text
+
+
+def test_a_probe_that_failed_keeps_its_reason_out_of_the_response(panel, caplog):
+    panel.ssh_script = lambda host, script, timeout=60: Proc(
+        returncode=255, stderr="Permission denied (publickey)")
+
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.gpu_status()
+
+    assert exc.value.status_code == 502
+    assert exc.value.detail == "could not read the cards on the GPU host"
+    assert "Permission denied" not in exc.value.detail
+    assert "Permission denied" in caplog.text
 
 
 # --- the models folder is a cached reading ---------------------------------

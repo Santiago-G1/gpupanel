@@ -882,7 +882,8 @@ def gpu_status():
     probe = probe_cards()
     if not probe["host_ok"]:
         errors = probe.get("errors") or ["no answer"]
-        raise HTTPException(502, f"card probe failed: {errors[0]}")
+        log.warning("card probe failed: %s", errors[0][:500])
+        raise HTTPException(502, "could not read the cards on the GPU host")
     return single_card(probe["cards"], probe)
 
 
@@ -1960,11 +1961,17 @@ def _apply_power(planned):
         raise HTTPException(400, "no card on this host exposes a settable power limit")
 
     results = []
-    for card, _watts, command in settable:
+    for card, watts, command in settable:
         p = ssh(GPU_HOST, command)
         entry = {"index": card.get("index"), "ok": p.returncode == 0}
         if p.returncode != 0:
-            entry["error"] = (p.stderr or p.stdout).strip()[:200] or "the driver refused the limit"
+            # The driver's own words carry the card's address and bus: the
+            # operator reads them in `docker logs`, the page gets one sentence.
+            detail = (p.stderr or p.stdout or "").strip()
+            if detail:
+                log.warning("power limit: GPU %s refused %s W: %s",
+                            card.get("index"), watts, detail[:500])
+            entry["error"] = "the driver refused the limit"
         results.append(entry)
     for card in skipped:
         # Not a refusal: a vendor with no power cap is a different answer than
@@ -1972,7 +1979,7 @@ def _apply_power(planned):
         results.append({"index": card.get("index"), "vendor": card.get("vendor"),
                         "skipped": "this vendor exposes no power limit"})
     if not any(entry.get("ok") for entry in results):
-        raise HTTPException(502, results[0].get("error") or "no card accepted the limit")
+        raise HTTPException(502, "no card accepted the limit")
     return results
 
 
