@@ -968,6 +968,17 @@ def test_the_startup_check_leaves_no_file_behind(panel, tmp_path):
     assert not (tmp_path / "auto.json").exists()  # it checks, it does not write the state
 
 
+def test_a_reset_moves_the_card_snapshot_counter(panel):
+    # The reset is a write of gpus_known too, so a caller that took its
+    # snapshot before it cannot go on to record a change over the fresh state.
+    a = {"uuid": "GPU-aaaa-1111", "name": "Card A", "index": "0"}
+    panel.track_gpus([a])
+    before = panel.state["gpus_seq"]
+    panel.reset_settings("t")
+    assert panel.state["gpus_known"] is None
+    assert panel.state["gpus_seq"] > before
+
+
 def test_a_state_file_that_only_opens_read_only_stops_the_panel(panel, tmp_path, monkeypatch):
     # `-v ./auto.json:/state/auto.json:ro`: the directory takes the probe file
     # and every later `os.replace()` fails, so the file is asked as well.
@@ -1556,8 +1567,8 @@ def test_the_card_evidence_is_gathered_outside_the_state_lock(panel):
 
 def test_a_change_that_two_callers_see_is_recorded_once(panel):
     # The evidence runs outside the lock, so the other caller can record the
-    # change while this one is still waiting on its SSH: the deferred write has
-    # to find the state moved and drop its older view, not add a second event.
+    # change while this one is still waiting on its SSH: the second look has to
+    # find nothing left to write instead of a duplicate event.
     board = [{"uuid": "GPU-aaaa-1111", "name": "Card A", "index": "0"}]
     panel.track_gpus(board)  # the baseline
     calls = []

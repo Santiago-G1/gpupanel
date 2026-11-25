@@ -2352,9 +2352,13 @@ def reset_settings(_: str = Depends(require_auth)):
         # A reset is not a logout: the nonces of logged-out sessions keep their
         # value, or the reset would hand every revoked cookie back.
         revoked = state.get("revoked") or {}
+        seq = int(state.get("gpus_seq") or 0)
         state.clear()
         state.update(copy.deepcopy(DEFAULTS))
         state["revoked"] = revoked
+        # The reset writes gpus_known too (back to no baseline): a caller that
+        # took its snapshot before it must not write that snapshot afterwards.
+        state["gpus_seq"] = seq + 1
         save_state()
     last_busy = time.time()
     record_action("settings reset to defaults")
