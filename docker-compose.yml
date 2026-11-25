@@ -19,6 +19,11 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       - TZ=${TZ:-Etc/UTC}
       # Required: where nvidia-smi answers, and the router that loads models.
