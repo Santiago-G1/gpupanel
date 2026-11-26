@@ -353,20 +353,27 @@ function renderJellyfinAccel(s) {
 function deriveMode(s) {
   // ComfyUI keeps the card while it is up, so it wins over every other reading.
   if (str(s.comfyui && s.comfyui.state) === 'running') return 'image';
+  const cfg = s.configured || {};
   const ml = str(s.immich_ml);
   const jf = str(s.jellyfin_accel);
-  const loaded = llamaBusy(s);
-  // A deployment without Immich or Jellyfin has nothing to arbitrate but the
-  // models: the card is llama.cpp's while something is loaded.
-  if (ml === 'unconfigured' && jf === 'unconfigured') return loaded ? 'llm' : 'idle';
+  const loaded = llamaBusy(s) > 0;
+  const fallback = str(cfg.jellyfin_fallback) || 'vaapi';
+  const jfOnCard = !!jf && jf !== fallback && jf !== 'none' && jf !== 'unknown';
+  // A deployment with one consumer is the common case: judge it by the one it
+  // has, instead of naming a consumer that is not installed.
+  if (!cfg.immich && !cfg.jellyfin) return loaded ? 'llm' : 'idle';
+  if (cfg.immich && !cfg.jellyfin) {
+    return ml === 'running' ? (loaded ? 'balanced' : 'media') : (loaded ? 'llm' : 'idle');
+  }
+  if (!cfg.immich && cfg.jellyfin) {
+    return jfOnCard ? (loaded ? 'balanced' : 'media') : (loaded ? 'llm' : 'idle');
+  }
+  // Both configured: a probe that did not answer is not a mode.
+  if (!ml || !jf) return 'mixed';
   // "LLM": the card belongs to llama.cpp; Immich ML (CUDA) is the only other
   // consumer that has to stop for it.
   if (ml === 'exited' || ml === 'created' || ml === 'paused') return 'llm';
-  if (ml === 'running') {
-    const fallback = str((s.configured || {}).jellyfin_fallback) || 'vaapi';
-    const onCard = !!jf && jf !== fallback && jf !== 'none' && jf !== 'unknown' && jf !== 'unconfigured';
-    return onCard ? (loaded ? 'balanced' : 'media') : 'igpu';
-  }
+  if (ml === 'running') return jfOnCard ? (loaded ? 'balanced' : 'media') : 'igpu';
   return 'mixed';
 }
 
