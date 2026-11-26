@@ -45,6 +45,18 @@ CARD = {
 }
 
 
+class Reply:
+    """What `httpx` returns, as far as the router calls look at it."""
+
+    def __init__(self, status_code, body=None):
+        self.status_code = status_code
+        self.body = body or {}
+        self.is_success = 200 <= status_code < 300
+
+    def json(self):
+        return self.body
+
+
 def card(**overrides):
     one = dict(CARD, **overrides)
     one["util_max"] = int(float(one["util"])) if one["util"] not in ("N/A", None) else 0
@@ -134,6 +146,43 @@ def test_modes_take_no_action_that_does_not_exist(panel):
 
     panel.set_mode("image", "t")
     assert panel.state["last_action"] == "mode Image: llama.cpp unloaded"
+
+
+def test_an_unload_the_router_refused_is_an_error(panel):
+    panel.llama_loaded = lambda: [{"id": "big", "status": "loaded"}, {"id": "small", "status": "loaded"}]
+    panel.llama_request = lambda *a, **kw: Reply(500)
+
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.llama_unload_all()
+    assert exc.value.status_code == 502
+
+
+def test_image_mode_does_not_start_comfyui_when_the_router_refuses(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, COMFY_CONTAINER="comfyui")
+    stub_gpu(panel, card())
+    panel.llama_loaded = lambda: [{"id": "big", "status": "loaded"}]
+    panel.llama_request = lambda *a, **kw: Reply(404)
+    started = []
+    monkeypatch.setattr(panel, "comfy", lambda action: started.append(action) or {"action": action, "ok": True})
+
+    out = panel.set_mode("image", "t")
+
+    # The model is still resident: starting ComfyUI is the OOM this mode avoids.
+    assert started == []
+    assert out["llama"]["error"]
+    assert panel.state["last_action"].startswith("mode Image: the router did not free the card")
+
+
+def test_media_mode_starts_immich_when_nothing_was_loaded(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, IMMICH_HOST="root@immich.test")
+    stub_gpu(panel, card())
+    panel.llama_loaded = lambda: []
+    started = []
+    monkeypatch.setattr(panel, "immich_ml", lambda action: started.append(action) or {"action": action, "ok": True})
+
+    panel.set_mode("media", "t")
+
+    assert started == ["start"]
 
 
 def test_auto_switch_leaves_absent_consumers_alone(panel):

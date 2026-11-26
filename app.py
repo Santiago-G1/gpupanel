@@ -970,10 +970,22 @@ def llama_loaded():
 
 
 def llama_unload_all():
-    out = []
+    """Unload every resident model. A refusal is an error, not an unload.
+
+    `POST /models/unload` answered 404/500 used to be counted as done, and the
+    caller then announced a freed card that still held 15 GB.
+    """
+    out, refused = [], []
     for m in llama_loaded():
         r = llama_request("POST", "/models/unload", json={"model": m["id"]}, timeout=60)
-        out.append({"model": m["id"], "http": r.status_code})
+        if 200 <= r.status_code < 300:
+            out.append({"model": m["id"], "http": r.status_code})
+        else:
+            refused.append({"model": m["id"], "http": r.status_code})
+    if refused:
+        log.warning("the router did not unload %s",
+                    ", ".join(f"{m['model']} ({m['http']})" for m in refused))
+        raise HTTPException(502, f"the router did not unload {len(refused)} model(s)")
     return out
 
 
@@ -1971,6 +1983,17 @@ def unload_models(result, done):
     return False
 
 
+def card_freed(result, done):
+    """Unload the models and say whether the card is really llama.cpp's to give.
+
+    A router that is down, or one that refused the unload, still holds the VRAM:
+    starting ComfyUI or Immich ML on top of it is the OOM the mode exists to
+    prevent. Nothing loaded is a different answer — there is nothing to free.
+    """
+    unloaded = unload_models(result, done)
+    return not isinstance(result.get("llama"), dict) and (unloaded or result.get("llama") == [])
+
+
 @app.post("/api/mode/{mode}")
 def set_mode(mode: str, _: str = Depends(require_auth)):
     global llm_blocked
@@ -1998,7 +2021,9 @@ def set_mode(mode: str, _: str = Depends(require_auth)):
         record_action(f"mode LLM: {', '.join(done) or 'nothing to move'}"
                       + (f" ({', '.join(stuck)} did not follow)" if stuck else " (card free for llama.cpp)"))
     elif mode == "media":
-        unload_models(result, done)
+        if not card_freed(result, done):
+            record_action("mode Media: the router did not free the card, nothing started")
+            return result
         if IMMICH:
             attempt(result, "immich_ml", lambda: immich_ml("start"), done, "Immich ML on")
         if JELLYFIN:
@@ -2019,7 +2044,9 @@ def set_mode(mode: str, _: str = Depends(require_auth)):
     else:
         # Image generation needs the whole card: unload llama.cpp, stop the
         # Immich workload and move Jellyfin off (it keeps transcoding).
-        unload_models(result, done)
+        if not card_freed(result, done):
+            record_action("mode Image: the router did not free the card, nothing started")
+            return result
         if IMMICH:
             attempt(result, "immich_ml", lambda: immich_ml("stop"), done, "Immich ML stopped")
         if JELLYFIN:
