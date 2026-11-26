@@ -124,6 +124,10 @@ a consistent state and records the action in the state file.
 | `balanced` | untouched | started | the card's encoder | stopped |
 | `image` | unloaded | stopped | the fallback device | started |
 
+`media` and `image` unload llama.cpp first, and only then start a consumer: a
+router that is down or that refuses the unload still holds the VRAM, so the mode
+answers with that instead of starting ComfyUI on top of it.
+
 `balanced` is the only one that deliberately leaves the card oversubscribed: it
 is for a small LLM next to Immich's face detection, and it is the one that can
 fail with a `cudaMalloc` if a large model is asked for later.
@@ -138,6 +142,10 @@ of all cards as the idle clock. Timers, in minutes, all `0 = off`:
 | `llama_idle_min` | 60 | unload the resident models and give the card back |
 | `ml_idle_min` | 0 | stop Immich ML, but only with an empty ML queue |
 | `comfy_idle_min` | 10 | stop ComfyUI, but only with an empty prompt queue |
+
+Each consumer's clock starts when the consumer does, not when the card was last
+busy: a ComfyUI started on a card that had been idle for an hour is not stopped
+on the next tick for being idle.
 
 The queue checks are the point: a release never kills work in flight. The last
 automatic action and the reason are shown on the dashboard and kept in the state
@@ -326,7 +334,7 @@ abridged and with the numbers shortened:
   "immich_ffmpeg": {"accel": "nvenc", "preferredHwDevice": ""},
   "jellyfin_accel": "vaapi",
   "llama": [{"id": "some-model", "status": "loaded"}],
-  "llama_counts": {"total": 7, "loaded": 1},
+  "llama_counts": {"total": 7, "loaded": 1, "loading": 0},
   "disk_models": [{"id": "some-model", "size": 22749880640, "mtime": 1793230206, "served": true, "loaded": true}],
   "comfyui": {"state": "created"}
 }
@@ -334,7 +342,9 @@ abridged and with the numbers shortened:
 
 The readings are strings exactly as `nvidia-smi` prints them, `N/A` included; the
 two computed fields are `util_max` (an int) for the idle clock and `power_limits`
-(one per card) for the dashboard. A consumer that is not configured answers
+(one per card) for the dashboard. `llama_counts.loading` counts the models the
+router is still loading: they already hold the VRAM, so the dashboard treats
+them as in use. A consumer that is not configured answers
 `"unconfigured"` instead of an object, so a client can tell it apart from a
 consumer that is down. `disk_models` is `[]` until `LLAMA_MODELS_DIR` is set,
 and `{"error": …}` when the folder cannot be read; `served` and `loaded` are
@@ -358,7 +368,7 @@ them as models. The dashboard marks a row `●` loaded (which includes
 | `PANEL_USER` | `admin` | |
 | `SESSION_TTL` | `604800` | Seconds. |
 | `LOGIN_DELAY` | `0.4` | Seconds burned on a bad password. |
-| `LOGIN_MAX_FAILURES` | `5` | Failed logins from one address before the answer is `429`. `0` disables it. |
+| `LOGIN_MAX_FAILURES` | `5` | Failed logins from one address before the answer is `429`. Behind a reverse proxy the address is the last `X-Forwarded-For` hop, which is the one the proxy wrote. `0` disables it. |
 | `LOGIN_WINDOW` | `300` | Seconds the failures are counted over. |
 | `STATE_PATH` | `/state/auto.json` | Inside the container; the Compose file bind-mounts `./state` there. |
 | `AI_HOST` | `GPU_HOST` | Where llama.cpp and ComfyUI run. |
