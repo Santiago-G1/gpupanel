@@ -148,6 +148,18 @@ def test_modes_take_no_action_that_does_not_exist(panel):
     assert panel.state["last_action"] == "mode Image: llama.cpp unloaded"
 
 
+def test_the_power_list_cannot_be_longer_than_the_host(panel):
+    stub_gpu(panel, card())
+
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.set_power({"cards": [{"index": 0, "watts": 150}] * 5}, "t")
+    assert exc.value.status_code == 400
+
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.set_power({"cards": [{"index": 0, "watts": 150}, {"index": 0, "watts": 200}]}, "t")
+    assert exc.value.status_code == 400
+
+
 def test_a_loading_model_is_reported_as_in_use(panel):
     stub_gpu(panel, card())
     panel.llama_models = lambda: [{"id": "big", "status": "loading"}, {"id": "small", "status": "loaded"}]

@@ -2342,8 +2342,12 @@ def _set_power(body):
     else:
         if not isinstance(advanced, list) or not advanced:
             raise HTTPException(400, "cards must be a non-empty list")
+        # One command per entry: a list longer than the host has cards is a
+        # thousand `nvidia-smi` calls, not a setting.
+        if len(advanced) > len(cards):
+            raise HTTPException(400, "cards lists more entries than this host has cards")
         by_index = {str(card.get("index")): card for card in cards}
-        planned = []
+        planned, seen = [], set()
         for entry in advanced:
             if not isinstance(entry, dict):
                 raise HTTPException(400, "every entry of cards must be an object")
@@ -2351,6 +2355,9 @@ def _set_power(body):
             card = by_index.get(str(index))
             if card is None:
                 raise HTTPException(400, f"this host has no card {index!r}")
+            if str(index) in seen:
+                raise HTTPException(400, f"cards names GPU {index} twice")
+            seen.add(str(index))
             if card.get("power_per_card") is False:
                 # One value, every card of that vendor: pretend otherwise and the
                 # operator sets GPU 1 and silently moves GPU 0 too.
