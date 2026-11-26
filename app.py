@@ -2205,7 +2205,8 @@ def _restore_power_limits(pending, attempt, attempts):
     # Re-read under the lock: a limit the operator changed, or forgot, while
     # this thread was waiting must not be overwritten with the value it saw at
     # start.
-    saved = dict(state.get("power_limits") or {})
+    with STATE_LOCK:
+        saved = dict(state.get("power_limits") or {})
     cards = gpu_status()["gpus"]
     if not cards:
         log.info("power limits: the host answers with no cards yet (attempt %d/%d)",
@@ -2440,14 +2441,16 @@ def reset_settings(_: str = Depends(require_auth)):
     with STATE_LOCK:
         # A reset is not a logout: the nonces of logged-out sessions keep their
         # value, or the reset would hand every revoked cookie back.
-        revoked = state.get("revoked") or {}
-        seq = int(state.get("gpus_seq") or 0)
-        state.clear()
-        state.update(copy.deepcopy(DEFAULTS))
-        state["revoked"] = revoked
+        fresh = copy.deepcopy(DEFAULTS)
+        fresh["revoked"] = state.get("revoked") or {}
         # The reset writes gpus_known too (back to no baseline): a caller that
         # took its snapshot before it must not write that snapshot afterwards.
-        state["gpus_seq"] = seq + 1
+        fresh["gpus_seq"] = int(state.get("gpus_seq") or 0) + 1
+        # Updated, never emptied: `/api/status` reads the settings without the
+        # lock, and an emptied dict is a KeyError for it.
+        state.update(fresh)
+        for key in [name for name in state if name not in fresh]:
+            del state[key]
         save_state()
     last_busy = time.time()
     record_action("settings reset to defaults")

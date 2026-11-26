@@ -148,6 +148,21 @@ def test_modes_take_no_action_that_does_not_exist(panel):
     assert panel.state["last_action"] == "mode Image: llama.cpp unloaded"
 
 
+def test_a_reset_restores_the_defaults_and_keeps_the_revoked_nonces(panel):
+    panel.state["llama_idle_min"] = 7
+    panel.state["gpus_known"] = {"uuid:GPU-1": "2026-11-26T00:00:00"}
+    panel.state["revoked"] = {"n1": 4102444800}
+    seq = panel.state["gpus_seq"]
+
+    panel.reset_settings("t")
+
+    assert panel.state["llama_idle_min"] == panel.DEFAULTS["llama_idle_min"]
+    assert panel.state["gpus_known"] is None
+    # A reset is not a logout: the revoked nonces survive it.
+    assert panel.state["revoked"] == {"n1": 4102444800}
+    assert panel.state["gpus_seq"] == seq + 1
+
+
 def test_a_state_file_with_wrong_types_still_starts(monkeypatch, tmp_path):
     (tmp_path / "auto.json").write_text(json.dumps({
         "last_busy": "yesterday",
