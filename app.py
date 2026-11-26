@@ -1926,6 +1926,17 @@ def health():
 
 
 # --- api ---
+# What the page can say about a probe that failed. The exception itself carries
+# the internal URL or the SSH command line, and that belongs in `docker logs`.
+PROBE_LABELS = {
+    "immich_ml": "Immich ML",
+    "immich_ffmpeg": "Immich",
+    "jellyfin_accel": "Jellyfin",
+    "llama": "the router",
+    "comfyui": "ComfyUI",
+}
+
+
 @app.get("/api/status")
 def status(_: str = Depends(require_auth)):
     gpu = gpu_status()
@@ -1966,7 +1977,8 @@ def status(_: str = Depends(require_auth)):
         # Each answer is kept, including the ones that are exceptions: a probe
         # that failed is a reading too, and it is not worth a 500.
         if isinstance(value, Exception):
-            out[key] = {"error": str(value)}
+            log.warning("%s probe failed: %s", key, value)
+            out[key] = {"error": f"{PROBE_LABELS.get(key, key)} did not answer"}
         else:
             out[key] = value
 

@@ -148,6 +148,20 @@ def test_modes_take_no_action_that_does_not_exist(panel):
     assert panel.state["last_action"] == "mode Image: llama.cpp unloaded"
 
 
+def test_a_failed_probe_answers_with_a_sentence_not_its_address(panel):
+    stub_gpu(panel, card())
+
+    def broken():
+        raise RuntimeError("Client error '401 Unauthorized' for url 'http://llama.test:8080/v1/models'")
+
+    panel.llama_models = broken
+
+    status = panel.status("t")
+
+    assert status["llama"] == {"error": "the router did not answer"}
+    assert "llama.test" not in json.dumps(status["llama"])
+
+
 def test_a_reset_restores_the_defaults_and_keeps_the_revoked_nonces(panel):
     panel.state["llama_idle_min"] = 7
     panel.state["gpus_known"] = {"uuid:GPU-1": "2026-11-26T00:00:00"}
@@ -950,7 +964,8 @@ def test_the_folder_survives_a_router_that_raises(monkeypatch, tmp_path):
     panel.ssh = lambda host, command, timeout=30: Proc("big.gguf\t2048\t1700000000\n")
     status = panel.status("t")
 
-    assert status["llama"] == {"error": "router down"}
+    # The reason is a log line; the page gets one sentence.
+    assert status["llama"] == {"error": "the router did not answer"}
     # A listing with no marks, not an error: the folder did answer.
     assert status["disk_models"] == [
         {"id": "big", "size": 2048, "mtime": 1700000000, "served": False, "loaded": False}
