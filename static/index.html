@@ -285,7 +285,7 @@ async function act(btn, path, body, opts = {}) {
     setBusy(btn, false);
     if (group) setGroupDisabled(group, false);
     endRequest();
-    await refresh();
+    await refresh(true);
     if (ok) toast(opts.done || 'Done');
   }
 }
@@ -593,7 +593,10 @@ function renderInventory(inv) {
   box.innerHTML = html;
 }
 
-async function refresh() {
+// One `/api/status` at a time. The answer can take 30 s (an SSH of the card
+// host that is timing out), and a poll that lands on top of another paints an
+// older answer over a newer one.
+async function fetchAndPaint() {
   let s;
   try { s = await api('/api/status'); }
   catch (e) {
@@ -925,6 +928,17 @@ $('log-follow').onchange = () => {
   loadLogs();
 };
 loadLogs();
+
+let inFlight = null;
+
+function refresh(force) {
+  if (inFlight && !force) return inFlight;
+  const run = fetchAndPaint().finally(() => {
+    if (inFlight === run) inFlight = null;
+  });
+  inFlight = run;
+  return run;
+}
 
 refresh();
 setInterval(refresh, 5000);

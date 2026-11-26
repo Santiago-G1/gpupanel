@@ -41,7 +41,8 @@ const ctx = {
     activeElement: null,
   },
   location: {href: 'http://panel.test/', pathname: '/', origin: 'http://panel.test'},
-  fetch: () => Promise.reject(new Error('offline')),
+  fetch: () => { ctx.__fetches += 1; return Promise.reject(new Error('offline')); },
+  __fetches: 0,
   localStorage: {getItem: () => null, setItem: () => {}},
   setInterval: () => 0, clearInterval: () => {}, setTimeout: () => 0, clearTimeout: () => {},
   encodeURIComponent, console,
@@ -68,8 +69,10 @@ def run(tmp_path, body):
         "const src = fs.readFileSync(process.argv[2], 'utf8');\n"
         f"{STUBS}"
         "vm.createContext(ctx);\n"
-        f"const out = vm.runInContext(src + '\\n' + {json.dumps('(() => { ' + body + ' })()')}, ctx);\n"
-        "console.log(JSON.stringify(out));\n"
+        f"const out = vm.runInContext(src + '\\n' + {json.dumps('(async () => { ' + body + ' })()')}, ctx);\n"
+        "Promise.resolve(out)\n"
+        "  .then((value) => console.log(JSON.stringify(value)))\n"
+        "  .catch((err) => { console.error(err); process.exit(1); });\n"
     )
     result = subprocess.run(
         ["node", str(tmp_path / "run.js"), str(tmp_path / "index.js")],
@@ -91,6 +94,19 @@ def modes(tmp_path, cases):
     payload = json.dumps([state for state, _ in cases])
     got = run(tmp_path, f"return {payload}.map((s) => deriveMode(s));")
     return list(zip(got, [want for _, want in cases], strict=True))
+
+
+def test_a_poll_does_not_overlap_the_one_in_flight(tmp_path):
+    body = """
+    await refresh();
+    const before = __fetches;
+    const first = refresh();
+    const second = refresh();
+    return [__fetches - before, first === second];
+    """
+    # Two callers, one request: the second reads the answer the first is already
+    # waiting for instead of asking again and painting it afterwards.
+    assert run(tmp_path, body) == [1, True]
 
 
 def test_a_reading_is_escaped_before_it_reaches_the_markup(tmp_path):
