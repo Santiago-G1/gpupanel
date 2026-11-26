@@ -385,7 +385,9 @@ function deriveMode(s) {
 function unavailable(sel, off) {
   document.querySelectorAll(sel).forEach((b) => {
     b.disabled = !!off;
-    b.title = off ? 'Not configured in this deployment' : '';
+    // The title is only written when it has something to say: clearing it here
+    // erased the fallback hint the accelerator buttons were built with.
+    if (off) b.title = 'Not configured in this deployment';
   });
 }
 
