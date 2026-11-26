@@ -160,6 +160,16 @@ def test_the_power_list_cannot_be_longer_than_the_host(panel):
     assert exc.value.status_code == 400
 
 
+def test_a_second_release_does_not_store_the_fallback_as_the_old_device(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, JELLYFIN_HOST="root@jf.test", JELLYFIN_XML="/config.xml")
+    monkeypatch.setattr(panel, "jellyfin_accel", lambda: panel.JELLYFIN_FALLBACK)
+    monkeypatch.setattr(panel, "jellyfin_ensure_accel", lambda accel: {"accel": accel})
+
+    panel.jellyfin_release_gpu()
+
+    assert panel.state["jellyfin_before_llm"] is None
+
+
 def test_a_loading_model_is_reported_as_in_use(panel):
     stub_gpu(panel, card())
     panel.llama_models = lambda: [{"id": "big", "status": "loading"}, {"id": "small", "status": "loaded"}]

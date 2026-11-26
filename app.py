@@ -1355,7 +1355,9 @@ def jellyfin_ensure_accel(accel):
 def jellyfin_release_gpu():
     """Move Jellyfin off the card, remembering the device it had before."""
     current = jellyfin_accel()
-    if current in JELLYFIN_ACCEL_TYPES and current != "none":
+    # Remembered only when it is not already the fallback: a second release
+    # would otherwise store the fallback as "the device it had before".
+    if current in JELLYFIN_ACCEL_TYPES and current not in ("none", JELLYFIN_FALLBACK):
         state["jellyfin_before_llm"] = current
     return jellyfin_ensure_accel(JELLYFIN_FALLBACK)
 
