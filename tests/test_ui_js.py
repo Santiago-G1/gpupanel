@@ -68,7 +68,7 @@ def run(tmp_path, body):
         "const src = fs.readFileSync(process.argv[2], 'utf8');\n"
         f"{STUBS}"
         "vm.createContext(ctx);\n"
-        f"const out = vm.runInContext(src + '\\n' + '(() => {{ {body} }})()', ctx);\n"
+        f"const out = vm.runInContext(src + '\\n' + {json.dumps('(() => { ' + body + ' })()')}, ctx);\n"
         "console.log(JSON.stringify(out));\n"
     )
     result = subprocess.run(
@@ -91,6 +91,12 @@ def modes(tmp_path, cases):
     payload = json.dumps([state for state, _ in cases])
     got = run(tmp_path, f"return {payload}.map((s) => deriveMode(s));")
     return list(zip(got, [want for _, want in cases], strict=True))
+
+
+def test_a_reading_is_escaped_before_it_reaches_the_markup(tmp_path):
+    body = "return [readingHtml('<b>70</b>', 'W'), readingHtml('N/A', 'W'), readingHtml(70, 'W')];"
+
+    assert run(tmp_path, body) == ["&lt;b&gt;70&lt;/b&gt; W", "—", "70 W"]
 
 
 def test_a_deployment_with_only_immich_is_not_a_jellyfin_fallback(tmp_path):

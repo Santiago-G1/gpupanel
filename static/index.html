@@ -198,6 +198,9 @@ const esc = (v) => String(v === null || v === undefined ? '' : v)
 // A reading the card does not have is a dash, never `N/A °C`.
 const reading = (v, unit) => (v === null || v === undefined || v === 'N/A' || v === '')
   ? '—' : `${v}${unit ? ' ' + unit : ''}`;
+// The same reading for `innerHTML`: the driver's own strings are text, and this
+// is the only place they reach the markup without `esc()`.
+const readingHtml = (v, unit) => esc(reading(v, unit));
 
 /* ---------------------------------------------------------------- feedback */
 function toast(text, kind, sticky) {
@@ -614,7 +617,7 @@ async function refresh() {
     const util = num(x.util);
     const usedPct = used !== null && total ? Math.round(100 * used / total) : undefined;
     const link = x.pcie_gen && x.pcie_gen !== 'N/A'
-      ? `PCIe Gen${x.pcie_gen} ×${x.pcie_width}` : '';
+      ? `PCIe Gen${esc(x.pcie_gen)} ×${esc(x.pcie_width)}` : '';
     const vendor = VENDORS[x.vendor] || x.vendor || '';
     // The colour comes from the vendor the probe reported, never from the label:
     // a card it could not name is the neutral one, not an empty class.
@@ -629,15 +632,15 @@ async function refresh() {
         ${vendor ? `<span class="pill vendor-tag">${esc(vendor)}</span>` : ''}
         ${blind ? '<span class="pill off">driver does not see it</span>' : ''}
         ${offBus ? '<span class="pill off">not on the bus</span>' : ''}
-        <span class="mono"> · ${esc(x.pci || '')}${x.pci ? ' · ' : ''}${link}${link ? ' · ' : ''}${reading(x.mem_total, 'MiB')}</span>
+        <span class="mono"> · ${esc(x.pci || '')}${x.pci ? ' · ' : ''}${link}${link ? ' · ' : ''}${readingHtml(x.mem_total, 'MiB')}</span>
         <span class="pill ${Number(x.util) > 0 ? 'ok' : 'off'}">${Number(x.util) > 0 ? 'busy' : 'idle'}</span>
       </div>
       <div class="grid">${
         card('Utilization', util !== null ? util + ' %' : '—', util ?? undefined) +
         card('VRAM', used !== null && total !== null ? `${gib(used)} / ${gib(total)} GiB` : '—', usedPct) +
-        card('Temperature', reading(x.temp, '°C')) +
-        card('Power', `${reading(x.power_draw, 'W')} / ${reading(x.power_limit, 'W')}`) +
-        card('SM / Mem clock', `${reading(x.clk_sm, 'MHz')} / ${reading(x.clk_mem, 'MHz')}`)
+        card('Temperature', readingHtml(x.temp, '°C')) +
+        card('Power', `${readingHtml(x.power_draw, 'W')} / ${readingHtml(x.power_limit, 'W')}`) +
+        card('SM / Mem clock', `${readingHtml(x.clk_sm, 'MHz')} / ${readingHtml(x.clk_mem, 'MHz')}`)
       }</div>
     </div>`;
   }).join('') : '<div class="k">The card host answers and lists no card at all.</div>';
