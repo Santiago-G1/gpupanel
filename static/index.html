@@ -303,13 +303,19 @@ function human(sec) {
 
 // Every model counts here, including the unlisted ones.
 function llamaCounts(s) {
+  const list = Array.isArray(s.llama) ? s.llama : [];
+  const loading = (m) => String(m.status || '').toLowerCase().startsWith('load') && m.status !== 'loaded';
   const c = s.llama_counts;
   if (!c || c.error || typeof c.loaded !== 'number') {
-    const list = Array.isArray(s.llama) ? s.llama : [];
-    return {total: list.length, loaded: list.filter(m => m.status === 'loaded').length};
+    return {total: list.length, loaded: list.filter(m => m.status === 'loaded').length,
+      loading: list.filter(loading).length};
   }
-  return c;
+  // A router that predates the field, or a stub: count from the list itself.
+  return {...c, loading: typeof c.loading === 'number' ? c.loading : list.filter(loading).length};
 }
+
+// A loading model already holds the VRAM: the card is in use either way.
+const llamaBusy = (s) => { const c = llamaCounts(s); return c.loaded + (c.loading || 0); };
 
 // One row per file in the models folder: loaded, served, or just there.
 function diskRows(models) {
@@ -349,7 +355,7 @@ function deriveMode(s) {
   if (str(s.comfyui && s.comfyui.state) === 'running') return 'image';
   const ml = str(s.immich_ml);
   const jf = str(s.jellyfin_accel);
-  const loaded = llamaCounts(s).loaded;
+  const loaded = llamaBusy(s);
   // A deployment without Immich or Jellyfin has nothing to arbitrate but the
   // models: the card is llama.cpp's while something is loaded.
   if (ml === 'unconfigured' && jf === 'unconfigured') return loaded ? 'llm' : 'idle';
@@ -394,7 +400,7 @@ function paintState(s) {
   unavailable('#jf button', !cfg.jellyfin);
   unavailable('#comfy button[data-comfy]', !cfg.comfyui);
 
-  $('llama-unload').disabled = llamaCounts(s).loaded === 0;
+  $('llama-unload').disabled = llamaBusy(s) === 0;
 
   const at = $('auto-toggle');
   at.setAttribute('aria-pressed', autoState.enabled ? 'true' : 'false');
@@ -687,8 +693,11 @@ async function refresh() {
   const llama = Array.isArray(s.llama) ? s.llama : [];
   const counts = llamaCounts(s);
   const lp = $('llama-pill');
-  lp.textContent = counts.loaded ? counts.loaded + ' loaded' : 'no model';
-  lp.className = 'pill ' + (counts.loaded ? 'ok' : 'off');
+  const parts = [];
+  if (counts.loaded) parts.push(counts.loaded + ' loaded');
+  if (counts.loading) parts.push(counts.loading + ' loading');
+  lp.textContent = parts.length ? parts.join(' · ') : 'no model';
+  lp.className = 'pill ' + (parts.length ? 'ok' : 'off');
   // A folder the panel could not read is a line of its own, above the router's
   // list: the error costs the listing, never the marks the router can still give.
   const disk = s.disk_models;

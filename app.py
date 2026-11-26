@@ -2001,9 +2001,14 @@ def status(_: str = Depends(require_auth)):
     else:
         # Counts cover every model, not only the listed ones.
         out["llama"] = listed_models(models)
+        # `loading` is reported apart, not folded into `loaded`: the router is
+        # already holding the VRAM, so the page must count it as in use.
+        loading = [model for model in models
+                   if str(model["status"]).lower().startswith("load") and model["status"] != "loaded"]
         out["llama_counts"] = {
             "total": len(models),
             "loaded": sum(1 for model in models if model["status"] == "loaded"),
+            "loading": len(loading),
         }
     if isinstance(disk, Exception):
         out["disk_models"] = {"error": str(disk)}
