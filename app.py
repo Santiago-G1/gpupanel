@@ -409,6 +409,42 @@ async def security_headers(request: Request, call_next):
 
 
 # --- state ---
+# What each saved value has to be. The state file is documented as visible and
+# editable, so a hand edit that breaks a type is dropped with a warning instead
+# of ending the start or failing every tick.
+WHOLE_STATE = ("llama_idle_min", "ml_idle_min", "comfy_idle_min", "gpus_seq")
+REAL_STATE = ("last_busy",)
+MAP_STATE = ("revoked", "power_limits", "gpus_names", "gpus_down", "gpus_aer")
+LIST_STATE = ("gpus_events", "gpus_blind")
+
+
+def clean_state(stored):
+    """The saved settings that still make sense, key by key."""
+    clean = {k: v for k, v in stored.items() if k in DEFAULTS}
+    for key in WHOLE_STATE + REAL_STATE:
+        if key not in clean:
+            continue
+        try:
+            clean[key] = int(clean[key]) if key in WHOLE_STATE else float(clean[key])
+        except (TypeError, ValueError):
+            log.warning("state: dropping %s=%r", key, clean.pop(key))
+    for key in MAP_STATE + LIST_STATE:
+        want = dict if key in MAP_STATE else list
+        if key in clean and not isinstance(clean[key], want):
+            log.warning("state: dropping %s=%r", key, clean.pop(key))
+    if "enabled" in clean and not isinstance(clean["enabled"], bool):
+        log.warning("state: dropping enabled=%r", clean.pop("enabled"))
+    revoked = {}
+    for nonce, exp in (clean.get("revoked") or {}).items():
+        try:
+            revoked[str(nonce)] = int(exp)
+        except (TypeError, ValueError):
+            log.warning("state: dropping revoked nonce %r", nonce)
+    clean["revoked"] = revoked
+    clean.setdefault("power_limits", {})
+    return clean
+
+
 def load_state():
     """Settings from the volume. A missing file is normal; a broken one is not."""
     try:
@@ -419,11 +455,12 @@ def load_state():
     except Exception as exc:  # noqa: BLE001 - a bad file must not stop the panel
         log.warning("ignoring %s: %s", STATE_PATH, exc)
         return
+    if not isinstance(stored, dict):
+        log.warning("ignoring %s: not an object", STATE_PATH)
+        return
     global last_busy
     with STATE_LOCK:
-        state.update({k: v for k, v in stored.items() if k in DEFAULTS})
-        if not isinstance(state.get("power_limits"), dict):
-            state["power_limits"] = {}
+        state.update(clean_state(stored))
     if state.get("last_busy"):
         # A restart is not an idle period: keep counting from before it.
         last_busy = float(state["last_busy"])

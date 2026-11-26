@@ -148,6 +148,37 @@ def test_modes_take_no_action_that_does_not_exist(panel):
     assert panel.state["last_action"] == "mode Image: llama.cpp unloaded"
 
 
+def test_a_state_file_with_wrong_types_still_starts(monkeypatch, tmp_path):
+    (tmp_path / "auto.json").write_text(json.dumps({
+        "last_busy": "yesterday",
+        "llama_idle_min": "sixty",
+        "comfy_idle_min": "30",
+        "enabled": "yes",
+        "power_limits": [],
+        "gpus_events": {},
+        "revoked": {"old": "soon", "live": 4102444800},
+    }))
+    panel = load(monkeypatch, tmp_path)
+    panel.load_state()
+
+    assert panel.state["last_busy"] is None
+    assert panel.state["llama_idle_min"] == panel.DEFAULTS["llama_idle_min"]
+    assert panel.state["comfy_idle_min"] == 30
+    assert panel.state["enabled"] is True
+    assert panel.state["power_limits"] == {}
+    assert panel.state["gpus_events"] == []
+    assert panel.state["revoked"] == {"live": 4102444800}
+
+
+def test_a_state_file_that_is_not_an_object_is_ignored(monkeypatch, tmp_path):
+    (tmp_path / "auto.json").write_text("[1, 2, 3]")
+    panel = load(monkeypatch, tmp_path)
+
+    panel.load_state()
+
+    assert panel.state["llama_idle_min"] == panel.DEFAULTS["llama_idle_min"]
+
+
 def test_an_unload_the_router_refused_is_an_error(panel):
     panel.llama_loaded = lambda: [{"id": "big", "status": "loaded"}, {"id": "small", "status": "loaded"}]
     panel.llama_request = lambda *a, **kw: Reply(500)
