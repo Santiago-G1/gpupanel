@@ -163,6 +163,56 @@ def test_a_comfy_only_stop_is_still_recorded(monkeypatch, tmp_path):
     assert panel.state["last_action"].startswith("LLM in use: ComfyUI stopped")
 
 
+def test_a_just_started_comfyui_is_not_idle(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, COMFY_CONTAINER="comfyui")
+    stub_gpu(panel, card(util="0"))
+    panel.llama_models = lambda: []
+    monkeypatch.setattr(panel, "comfy_state", lambda: "running")
+    stopped = []
+    monkeypatch.setattr(panel, "comfy_release", lambda why=None: stopped.append(why) or True)
+    # The card has been quiet for an hour, but ComfyUI has just been started:
+    # the idle timer counts from the start, not from the card's last busy second.
+    panel.last_busy = time.time() - 3600
+
+    panel.auto_tick()
+    panel.auto_tick()
+
+    assert stopped == []
+    assert panel.CONSUMERS["comfyui"]["up"] is True
+
+
+def test_a_comfyui_that_has_been_up_too_long_is_stopped(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, COMFY_CONTAINER="comfyui")
+    stub_gpu(panel, card(util="0"))
+    panel.llama_models = lambda: []
+    monkeypatch.setattr(panel, "comfy_state", lambda: "running")
+    stopped = []
+    monkeypatch.setattr(panel, "comfy_release", lambda why=None: stopped.append(why) or True)
+    panel.last_busy = time.time() - 3600
+    panel.CONSUMERS["comfyui"].update({"up": True, "since": time.time() - 3600})
+
+    panel.auto_tick()
+
+    assert stopped and stopped[0].startswith("ComfyUI idle 60 min")
+
+
+def test_a_just_started_immich_ml_is_not_idle(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, IMMICH_HOST="root@immich.test")
+    stub_gpu(panel, card(util="0"))
+    panel.state["ml_idle_min"] = 5
+    panel.llama_models = lambda: []
+    monkeypatch.setattr(panel, "immich_ml_state", lambda: "running")
+    monkeypatch.setattr(panel, "immich_ml_queue_active", lambda: 0)
+    stopped = []
+    monkeypatch.setattr(panel, "immich_ml", lambda action: stopped.append(action) or {})
+    panel.last_busy = time.time() - 3600
+
+    panel.auto_tick()
+    panel.auto_tick()
+
+    assert stopped == []
+
+
 # --- readings the card does not report --------------------------------------
 def test_na_readings_do_not_crash_the_status(panel):
     stub_gpu(panel, card(util="N/A", power_min="N/A", power_max="N/A", power_limit="N/A"))

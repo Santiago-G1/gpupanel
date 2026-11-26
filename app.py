@@ -340,6 +340,21 @@ EVIDENCE_GATE = threading.Lock()
 PROBE_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="probe")
 last_busy = time.time()
 llm_blocked = False
+# When each consumer was first seen up. Its idle timer counts from the card
+# going quiet *or* the consumer appearing, whichever is later: a ComfyUI started
+# on a card that had been idle for an hour is not idle the moment it starts.
+CONSUMERS = {"comfyui": {"up": False, "since": 0.0}, "immich_ml": {"up": False, "since": 0.0}}
+
+
+def note_consumer(track, up, now=None):
+    """Record whether a consumer is up, and answer the quiet seconds that count."""
+    now = time.time() if now is None else now
+    if up and not track["up"]:
+        track["since"] = now
+    elif not up:
+        track["since"] = 0.0
+    track["up"] = up
+    return max(last_busy, track["since"])
 # Whether the last card probe failed, so an unreachable host costs one log line
 # instead of one per poll while the dashboard is open.
 probe_failing = False
@@ -1656,6 +1671,7 @@ def auto_tick():
     comfy_up = False
     with contextlib.suppress(Exception):
         comfy_up = comfy_state() == "running"
+    comfy_quiet = time.time() - note_consumer(CONSUMERS["comfyui"], comfy_up)
 
     if in_use:
         # llama.cpp has priority over every other consumer of the card.
@@ -1706,20 +1722,25 @@ def auto_tick():
                         back.append(f"Jellyfin back to {accel_label(accel)}")
                 llm_blocked = False
                 names = ", ".join(model_names([{"id": u["model"]} for u in unloaded]))
-                record_action(f"GPU idle {idle // 60} min: unloaded {names}"
+                record_action(f"GPU idle {int(idle // 60)} min: unloaded {names}"
                               f"{('; ' + ', '.join(back)) if back else ''}")
     else:
         llm_blocked = False
         # An idle ComfyUI hands the card back on its own.
-        if comfy_up and state["comfy_idle_min"] and idle > state["comfy_idle_min"] * 60:
-            if comfy_release(f"ComfyUI idle {idle // 60} min: stopped, card free again"):
+        if comfy_up and state["comfy_idle_min"] and comfy_quiet > state["comfy_idle_min"] * 60:
+            if comfy_release(f"ComfyUI idle {int(comfy_quiet // 60)} min: stopped, card free again"):
                 comfy_up = False
 
-    if IMMICH and state["ml_idle_min"] and idle > state["ml_idle_min"] * 60:
-        if immich_ml_state() == "running" and immich_ml_queue_active() == 0:
+    if IMMICH and state["ml_idle_min"]:
+        ml_up = immich_ml_state() == "running"
+        ml_quiet = time.time() - note_consumer(CONSUMERS["immich_ml"], ml_up)
+        if ml_up and ml_quiet > state["ml_idle_min"] * 60 and immich_ml_queue_active() == 0:
             with contextlib.suppress(HTTPException):
                 immich_ml("stop")
-            record_action(f"Immich ML idle {idle // 60} min: stopped to free VRAM")
+            record_action(f"Immich ML idle {int(ml_quiet // 60)} min: stopped to free VRAM")
+    else:
+        # The timer is off: forget the consumer so enabling it starts from now.
+        note_consumer(CONSUMERS["immich_ml"], False)
 
 
 async def auto_loop():
