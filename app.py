@@ -1835,6 +1835,20 @@ LOGIN_FAILURES = {}
 LOGIN_LOCK = threading.Lock()
 
 
+def client_key(request):
+    """Who a failed login is counted against, through the reverse proxy too.
+
+    Every request that arrives through the proxy comes from one address, so
+    counting by the peer alone let five bad passwords lock every browser out
+    for the whole window. The proxy appends the address it saw as the *last*
+    forwarded entry: anything to its left is the client's own text, and the
+    last one cannot be written by the client.
+    """
+    peer = getattr(getattr(request, "client", None), "host", None) or "unknown"
+    hops = [hop.strip() for hop in request.headers.get("x-forwarded-for", "").split(",") if hop.strip()]
+    return hops[-1] if hops else peer
+
+
 def login_throttled(where):
     """True when this caller has used up its failures in the window."""
     if not LOGIN_MAX_FAILURES:
@@ -1853,8 +1867,7 @@ def login_failed(where):
 
 @app.post("/api/login")
 def login(request: Request, body: dict = Body(...)):
-    client = getattr(request, "client", None)
-    where = getattr(client, "host", None) or "unknown"
+    where = client_key(request)
     if login_throttled(where):
         raise HTTPException(429, "too many failed logins, try again later")
     user = str(body.get("user") or "").strip()

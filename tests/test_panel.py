@@ -1507,6 +1507,26 @@ def test_guessing_the_password_stops(panel):
     assert exc.value.status_code == 429
 
 
+def test_the_login_limit_follows_the_proxy(panel):
+    proxy = types.SimpleNamespace(host="192.168.10.104")
+    for _ in range(5):
+        with pytest.raises(panel.HTTPException):
+            panel.login(request(client=proxy, headers={"x-forwarded-for": "203.0.113.9"}),
+                        {"user": "admin", "password": "nope"})
+
+    # Another client through the same proxy is not paying for those five.
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.login(request(client=proxy, headers={"x-forwarded-for": "203.0.113.10"}),
+                    {"user": "admin", "password": "nope"})
+    assert exc.value.status_code == 401
+
+    # The address that did guess is the one that waits.
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.login(request(client=proxy, headers={"x-forwarded-for": "203.0.113.9"}),
+                    {"user": "admin", "password": "nope"})
+    assert exc.value.status_code == 429
+
+
 def test_a_reading_the_vendor_does_not_report_is_not_a_number(panel):
     assert panel._tidy("55000", 1000) == "55"
     assert panel._tidy("") == "N/A"
