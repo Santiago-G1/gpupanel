@@ -727,7 +727,13 @@ async function fetchAndPaint() {
   const routerRows = llama.length
     ? llama.map(m => `<div class="mono" style="font-size:12px">${m.status === 'loaded' ? '●' : '○'} ${esc(m.id)}</div>`).join('')
     : '<span class="k">no response</span>';
-  $('llama-list').innerHTML = Array.isArray(disk) && disk.length ? diskRows(disk) : diskError + routerRows;
+  // A router that answered with an error is not an idle one: the folder rows
+  // would otherwise hide it and the page would read "no model" over a router
+  // that is down (or whose key was refused).
+  const routerError = !Array.isArray(s.llama) && s.llama && s.llama.error
+    ? `<span class="k">router: ${esc(s.llama.error)}</span>` : '';
+  $('llama-list').innerHTML = routerError
+    + (Array.isArray(disk) && disk.length ? diskRows(disk) : diskError + routerRows);
 
   const ml = typeof s.immich_ml === 'string' ? s.immich_ml : (s.immich_ml?.error ? 'error' : '—');
   const mp = $('ml-pill');

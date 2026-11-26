@@ -96,6 +96,33 @@ def modes(tmp_path, cases):
     return list(zip(got, [want for _, want in cases], strict=True))
 
 
+def test_a_router_that_answered_with_an_error_is_not_an_idle_one(tmp_path):
+    body = """
+    const status = {
+      gpu: {}, gpus: [], auto: {}, inventory: {}, configured: {},
+      immich_ml: 'unconfigured', jellyfin_accel: 'unconfigured',
+      comfyui: {state: 'unconfigured'},
+      llama: {error: 'the router did not answer'},
+      llama_counts: {error: 'the router did not answer'},
+      disk_models: [{id: 'big', size: 1024, mtime: 1, served: false, loaded: false}],
+    };
+    const box = {innerHTML: '', dataset: {}, style: {}, textContent: '', disabled: false,
+      classList: {toggle() {}, add() {}, remove() {}}, setAttribute() {}, addEventListener() {}};
+    const original = document.getElementById;
+    document.getElementById = (id) => (id === 'llama-list' ? box : original(id));
+    fetch = () => Promise.resolve({ok: true, status: 200,
+      headers: {get: () => 'application/json'}, json: () => Promise.resolve(status)});
+    await refresh(true);
+    return box.innerHTML;
+    """
+    shown = run(tmp_path, body)
+
+    # The folder rows are still there, and the router's failure is not hidden
+    # behind them.
+    assert "big" in shown
+    assert "router: the router did not answer" in shown
+
+
 def test_the_accelerator_buttons_are_not_rebuilt_for_the_same_reading(tmp_path):
     body = """
     const cfg = {jellyfin_accel_types: [{value: 'nvenc', label: 'NVENC'},
