@@ -185,6 +185,20 @@ def test_media_mode_starts_immich_when_nothing_was_loaded(monkeypatch, tmp_path)
     assert started == ["start"]
 
 
+def test_a_manual_consumer_action_clears_the_llm_priority_lock(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, COMFY_CONTAINER="comfyui", IMMICH_HOST="root@immich.test")
+    monkeypatch.setattr(panel, "llm_blocked", True)
+    monkeypatch.setattr(panel, "comfy", lambda action: {"action": action, "ok": True})
+    monkeypatch.setattr(panel, "immich_ml", lambda action: {"action": action, "ok": True})
+
+    panel.comfy_action("start", "t")
+    assert panel.llm_blocked is False
+
+    monkeypatch.setattr(panel, "llm_blocked", True)
+    panel.immich_ml_action("start", "t")
+    assert panel.llm_blocked is False
+
+
 def test_auto_switch_leaves_absent_consumers_alone(panel):
     stub_gpu(panel, card(util="90"))
     panel.llama_models = lambda: [{"id": "big", "status": "loading"}]

@@ -2434,16 +2434,27 @@ def llama_logs_api(lines: int = 200, _: str = Depends(require_auth)):
 
 @app.post("/api/comfy/{action}")
 def comfy_action(action: str, _: str = Depends(require_auth)):
-    return comfy(action)
+    global llm_blocked
+    out = comfy(action)
+    # A consumer the operator put back on the card must be movable again: the
+    # priority lock only means "already tried, nothing moved".
+    llm_blocked = False
+    return out
 
 
 @app.post("/api/immich/ml/{action}")
 def immich_ml_action(action: str, _: str = Depends(require_auth)):
+    global llm_blocked
     if action not in ("start", "stop", "restart"):
         raise HTTPException(400, "action must be start, stop or restart")
-    return immich_ml(action)
+    out = immich_ml(action)
+    llm_blocked = False
+    return out
 
 
 @app.post("/api/jellyfin/accel/{accel}")
 def jellyfin_accel_action(accel: str, _: str = Depends(require_auth)):
-    return jellyfin_set_accel(accel)
+    global llm_blocked
+    out = jellyfin_set_accel(accel)
+    llm_blocked = False
+    return out
