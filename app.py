@@ -1757,8 +1757,12 @@ def auto_tick():
 
 async def auto_loop():
     while True:
-        with contextlib.suppress(Exception):
+        try:
             await asyncio.to_thread(auto_tick)
+        except Exception:  # noqa: BLE001 - one bad tick must not end the loop
+            # Swallowed, this used to leave the auto switch dead with the page
+            # still showing "Auto: on".
+            log.exception("the auto switch tick failed")
         await asyncio.sleep(20)
 
 
