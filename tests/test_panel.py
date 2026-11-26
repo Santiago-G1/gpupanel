@@ -282,6 +282,20 @@ def test_image_mode_does_not_start_comfyui_when_the_router_refuses(monkeypatch, 
     assert panel.state["last_action"].startswith("mode Image: the router did not free the card")
 
 
+def test_media_mode_starts_immich_when_the_router_is_down(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, IMMICH_HOST="root@immich.test")
+    stub_gpu(panel, card())
+    panel.llama_loaded = lambda: (_ for _ in ()).throw(RuntimeError("connection refused"))
+    started = []
+    monkeypatch.setattr(panel, "immich_ml", lambda action: started.append(action) or {"action": action, "ok": True})
+
+    panel.set_mode("media", "t")
+
+    # Nothing answered to unload: the card is not provably taken, and refusing
+    # would leave the operator unable to start the consumer from the panel.
+    assert started == ["start"]
+
+
 def test_media_mode_starts_immich_when_nothing_was_loaded(monkeypatch, tmp_path):
     panel = load(monkeypatch, tmp_path, IMMICH_HOST="root@immich.test")
     stub_gpu(panel, card())

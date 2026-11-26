@@ -2046,8 +2046,12 @@ def unload_models(result, done):
     """Unload llama.cpp, and only say so when something was actually unloaded."""
     try:
         unloaded = llama_unload_all()
+    except HTTPException as exc:
+        # The router answered and refused: the models are still resident.
+        result["llama"] = {"error": str(exc.detail)}
+        return False
     except Exception as exc:  # noqa: BLE001 - a router that is down is an answer
-        result["llama"] = {"error": str(exc)}
+        result["llama"] = {"error": str(exc), "unreachable": True}
         return False
     result["llama"] = unloaded
     if unloaded:
@@ -2064,7 +2068,13 @@ def card_freed(result, done):
     prevent. Nothing loaded is a different answer — there is nothing to free.
     """
     unloaded = unload_models(result, done)
-    return not isinstance(result.get("llama"), dict) and (unloaded or result.get("llama") == [])
+    answer = result.get("llama")
+    if isinstance(answer, dict) and answer.get("error"):
+        # A router that is not answering is not holding anything the panel can
+        # see, and refusing the mode there would be a regression: only a refusal
+        # is proof that the card is still occupied.
+        return bool(answer.get("unreachable"))
+    return unloaded or answer == []
 
 
 @app.post("/api/mode/{mode}")
