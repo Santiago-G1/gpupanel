@@ -148,6 +148,23 @@ def test_modes_take_no_action_that_does_not_exist(panel):
     assert panel.state["last_action"] == "mode Image: llama.cpp unloaded"
 
 
+def test_the_consumer_routes_refuse_an_unknown_action(panel):
+    for handler in (panel.comfy_action, panel.immich_ml_action):
+        with pytest.raises(panel.HTTPException) as exc:
+            handler("explode", "t")
+        assert exc.value.status_code == 400
+
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.jellyfin_accel_action("cuda", "t")
+    assert exc.value.status_code == 400
+
+
+def test_a_consumer_that_is_not_configured_is_skipped(panel):
+    assert panel.comfy_action("start", "t") == {"action": "start", "skipped": "ComfyUI is not configured"}
+    assert panel.immich_ml_action("start", "t") == {"action": "start", "skipped": "Immich is not configured"}
+    assert panel.jellyfin_accel_action("nvenc", "t") == {"accel": "nvenc", "skipped": "Jellyfin is not configured"}
+
+
 def test_the_power_list_cannot_be_longer_than_the_host(panel):
     stub_gpu(panel, card())
 
