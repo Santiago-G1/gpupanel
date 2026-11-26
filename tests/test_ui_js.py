@@ -96,6 +96,25 @@ def modes(tmp_path, cases):
     return list(zip(got, [want for _, want in cases], strict=True))
 
 
+def test_the_accelerator_buttons_are_not_rebuilt_for_the_same_reading(tmp_path):
+    body = """
+    const cfg = {jellyfin_accel_types: [{value: 'nvenc', label: 'NVENC'},
+      {value: 'vaapi', label: 'VAAPI'}], jellyfin_fallback: 'vaapi'};
+    const box = {innerHTML: '', dataset: {}, style: {}, textContent: '', disabled: false,
+      classList: {toggle() {}, add() {}, remove() {}}, setAttribute() {}, addEventListener() {}};
+    const original = document.getElementById;
+    document.getElementById = (id) => (id === 'jf' ? box : original(id));
+    renderJellyfinAccel({configured: cfg, jellyfin_accel: 'nvenc'});
+    const first = box.innerHTML;
+    box.innerHTML = '';
+    renderJellyfinAccel({configured: cfg, jellyfin_accel: 'nvenc'});
+    const second = box.innerHTML;
+    renderJellyfinAccel({configured: cfg, jellyfin_accel: 'vaapi'});
+    return [first.includes('data-accel="nvenc"'), second, box.innerHTML.includes('on')];
+    """
+    assert run(tmp_path, body) == [True, "", True]
+
+
 def test_a_poll_does_not_overlap_the_one_in_flight(tmp_path):
     body = """
     await refresh();

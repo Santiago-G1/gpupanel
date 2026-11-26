@@ -341,10 +341,16 @@ function renderJellyfinAccel(s) {
   const choices = Array.isArray(cfg.jellyfin_accel_types) ? cfg.jellyfin_accel_types : [];
   if (!choices.length) {
     box.innerHTML = '<span class="k">Jellyfin is not configured</span>';
+    box.dataset.rendered = '';
     return;
   }
   const current = str(s.jellyfin_accel);
   const fallback = str(cfg.jellyfin_fallback);
+  // Rebuilt only when something it shows has changed: writing the same buttons
+  // every five seconds takes the focus away from the one being tabbed to.
+  const key = [current, fallback, JSON.stringify(choices)].join('|');
+  if (box.dataset.rendered === key) return;
+  box.dataset.rendered = key;
   box.innerHTML = choices.map((c) => {
     const on = c.value === current ? ' class="on"' : (c.value === 'none' ? ' class="warn"' : '');
     const title = c.value === fallback ? ' title="fallback: where Jellyfin goes while llama.cpp has the card"' : '';
