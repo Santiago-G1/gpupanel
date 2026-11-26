@@ -35,6 +35,14 @@ services:
       - PANEL_USER=${PANEL_USER:-admin}
       - PANEL_PASSWORD=${PANEL_PASSWORD:?PANEL_PASSWORD is required}
       - PANEL_TOKEN=${PANEL_TOKEN:?PANEL_TOKEN is required}
+      # The session cookie and the login throttle, all with their defaults.
+      - SESSION_COOKIE=${SESSION_COOKIE:-panel_session}
+      - SESSION_TTL=${SESSION_TTL:-604800}
+      - LOGIN_DELAY=${LOGIN_DELAY:-0.4}
+      - LOGIN_MAX_FAILURES=${LOGIN_MAX_FAILURES:-5}
+      - LOGIN_WINDOW=${LOGIN_WINDOW:-300}
+      # Where the settings live: the bind mount below puts /state on ./state.
+      - STATE_PATH=${STATE_PATH:-/state/auto.json}
       # llama.cpp and ComfyUI: the host they run on, and optionally the Proxmox
       # CT to enter there. Empty AI_CTID means they run on the host itself.
       - AI_HOST=${AI_HOST:-}
@@ -44,8 +52,12 @@ services:
       - LLAMA_MODELS_DIR=${LLAMA_MODELS_DIR:-}
       # Optional display filter: only these model ids are ever named.
       - LLAMA_PUBLIC_MODELS=${LLAMA_PUBLIC_MODELS:-}
-      # How many cards the node should have: 0 reports without judging.
+      # How many cards the node should have: 0 reports without judging, and the
+      # exact set when a count is not enough.
       - GPU_EXPECTED=${GPU_EXPECTED:-0}
+      - GPU_EXPECTED_IDS=${GPU_EXPECTED_IDS:-}
+      # Kernel lines around a card change: 0 turns the extra SSH off.
+      - GPU_EVIDENCE=${GPU_EVIDENCE:-1}
       # Consumers. Empty means "not configured": the panel says so and leaves
       # that part of the card alone.
       - IMMICH_HOST=${IMMICH_HOST:-}

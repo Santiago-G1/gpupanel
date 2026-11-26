@@ -19,6 +19,7 @@ auto.json
 auto.json.probe
 
 # PYTHON
+.coverage
 __pycache__/
 *.pyo
 *.pyc
