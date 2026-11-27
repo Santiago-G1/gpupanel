@@ -11,7 +11,8 @@ services:
     init: true
     ports:
       # PUBLISH_ADDR is where the panel is reachable from: 127.0.0.1 keeps it
-      # off the LAN behind a reverse proxy, 0.0.0.0 publishes it everywhere.
+      # off the LAN behind a reverse proxy on the same host, 0.0.0.0 publishes
+      # it everywhere, and an address publishes it on that one interface.
       - "${PUBLISH_ADDR:-0.0.0.0}:${PUBLISH_PORT:?}:8099"
     # Neither the panel nor ssh needs a capability, and nothing it runs may gain
     # one. It still runs as root because the mounted key lives in /root/.ssh.
