@@ -184,3 +184,50 @@ def test_a_deployment_with_only_jellyfin_names_the_card_state(tmp_path):
     ]
 
     assert modes(tmp_path, cases) == [(want, want) for _, want in cases]
+
+
+def test_media_is_not_the_mode_while_a_model_is_on_the_card(tmp_path):
+    # The live reading: Immich ML running, Jellyfin on nvenc, and a 27B loaded.
+    both = {"immich": True, "jellyfin": True, "jellyfin_fallback": "vaapi"}
+    loaded = {"total": 4, "loaded": 1, "loading": 0}
+    cases = [
+        (status(both, immich_ml="running", jellyfin_accel="nvenc", llama_counts=loaded), "balanced"),
+        (status(both, immich_ml="running", jellyfin_accel="vaapi", llama_counts=loaded), "balanced"),
+        # Nothing on the card: media owns it, wherever Jellyfin transcodes.
+        (status(both, immich_ml="running", jellyfin_accel="nvenc",
+                llama_counts={"total": 4, "loaded": 0, "loading": 0}), "media"),
+        (status(both, immich_ml="running", jellyfin_accel="vaapi",
+                llama_counts={"total": 4, "loaded": 0, "loading": 0}), "igpu"),
+    ]
+
+    assert modes(tmp_path, cases) == [(want, want) for _, want in cases]
+
+
+def test_a_card_that_reports_no_utilization_is_not_idle(tmp_path):
+    body = """
+    const box = {innerHTML: '', dataset: {}, style: {}, textContent: '', disabled: false,
+      classList: {toggle() {}, add() {}, remove() {}}, setAttribute() {}, addEventListener() {}};
+    const original = document.getElementById;
+    document.getElementById = (id) => (id === 'gpu-cards' ? box : original(id));
+    const card = (util) => ({
+      index: '0', uuid: 'GPU-1', name: 'Tesla P100', driver: '580', mem_used: '1',
+      mem_total: '16384', util, temp: '40', power_draw: '30', power_limit: '175',
+      power_default: '250', power_min: '100', power_max: '250', clk_sm: '1328',
+      clk_mem: '715', pcie_gen: '3', pcie_width: '16', vendor: 'nvidia',
+      bus_visible: true, driver_visible: true, processes: [],
+    });
+    const answer = (util) => ({
+      gpu: card(util), gpus: [card(util)], auto: {}, inventory: {}, configured: {},
+      immich_ml: 'unconfigured', jellyfin_accel: 'unconfigured',
+      comfyui: {state: 'unconfigured'}, llama: [], llama_counts: {},
+    });
+    let payload = answer('N/A');
+    fetch = () => Promise.resolve({ok: true, status: 200,
+      headers: {get: () => 'application/json'}, json: () => Promise.resolve(payload)});
+    await refresh(true);
+    const unknown = box.innerHTML;
+    payload = answer('0');
+    await refresh(true);
+    return [unknown.includes('util unknown'), unknown.includes('>idle<'), box.innerHTML.includes('>idle<')];
+    """
+    assert run(tmp_path, body) == [True, False, True]

@@ -382,7 +382,9 @@ function deriveMode(s) {
   // "LLM": the card belongs to llama.cpp; Immich ML (CUDA) is the only other
   // consumer that has to stop for it.
   if (ml === 'exited' || ml === 'created' || ml === 'paused') return 'llm';
-  if (ml === 'running') return jfOnCard ? (loaded ? 'balanced' : 'media') : 'igpu';
+  // A model on the card outranks every reading of the consumers above it: an
+  // Immich ML that is up next to llama.cpp is shared, not media.
+  if (ml === 'running') return loaded ? 'balanced' : (jfOnCard ? 'media' : 'igpu');
   return 'mixed';
 }
 
@@ -637,6 +639,11 @@ async function fetchAndPaint() {
     // which is a different problem from a card that is not in the machine.
     const blind = x.driver_visible === false;
     const offBus = x.bus_visible === false;
+    // A reading the card does not report is not "idle": the same number drives
+    // the idle clock on the server, and `N/A` there used to read as zero.
+    const busy = util === null ? '' : util > 0 ? 'busy' : 'idle';
+    const busyPill = util === null ? '<span class="pill">util unknown</span>'
+      : `<span class="pill ${util > 0 ? 'ok' : 'off'}">${busy}</span>`;
     return `<div class="gpu-block vendor-${vkey}">
       <div class="k" style="margin:0 0 6px">
         <b style="color:var(--fg)">GPU ${esc(x.index ?? '—')}</b>
@@ -644,7 +651,7 @@ async function fetchAndPaint() {
         ${blind ? '<span class="pill off">driver does not see it</span>' : ''}
         ${offBus ? '<span class="pill off">not on the bus</span>' : ''}
         <span class="mono"> · ${esc(x.pci || '')}${x.pci ? ' · ' : ''}${link}${link ? ' · ' : ''}${readingHtml(x.mem_total, 'MiB')}</span>
-        <span class="pill ${Number(x.util) > 0 ? 'ok' : 'off'}">${Number(x.util) > 0 ? 'busy' : 'idle'}</span>
+        ${busyPill}
       </div>
       <div class="grid">${
         card('Utilization', util !== null ? util + ' %' : '—', util ?? undefined) +
