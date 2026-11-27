@@ -1457,6 +1457,25 @@ def test_a_card_the_driver_lost_is_not_a_refused_probe(panel):
     assert gpu["util_max"] == 0
 
 
+def test_a_probe_that_timed_out_is_not_a_card_the_driver_lost(panel):
+    # The probe kills a wedged nvidia-smi after 10 s and only the bus view comes
+    # back. Reading that as "the driver gave up on it" recorded a card loss and
+    # a flapping card for what was one slow process.
+    stub_probe(
+        panel,
+        sysfs=[{"bdf": "0000:01:00.0", "drm": "card0", "vendor": "0x10de", "driver": "nvidia",
+                "name": "Tesla P100 PCIe 16GB"}],
+        nvinfo=[{"uuid": "GPU-1111-2222", "bdf": "0000:01:00.0"}],
+        gpu_lines=[],
+        gpu_rc="124",
+    )
+    probe = panel.probe_cards()
+
+    card = probe["cards"][0]
+    assert card["driver_visible"] is None
+    assert any("did not answer in 10 s" in error for error in probe["errors"])
+
+
 def test_a_machine_whose_cards_all_went_is_an_event_not_a_502(monkeypatch, tmp_path):
     panel = load(monkeypatch, tmp_path, GPU_EXPECTED="2")
     board = [

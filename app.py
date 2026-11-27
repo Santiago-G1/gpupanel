@@ -935,6 +935,14 @@ def probe_cards():
     else:
         sections = parse_probe(text)
         cards, errors = build_cards(sections)
+        # A wedged `nvidia-smi` is not a card the driver lost: the probe kills it
+        # after 10 s and only the bus view comes back, which used to be recorded
+        # as `blind` and counted as flapping every time it happened.
+        if (sections["rc"].get("gpu") or "") == "124":
+            errors.append("nvidia-smi did not answer in 10 s: the driver's view is unknown")
+            for card in cards:
+                if card.get("driver_visible") is False:
+                    card["driver_visible"] = None
         probe = {
             "host_ok": True,
             "cards": cards,
