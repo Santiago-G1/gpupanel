@@ -2200,6 +2200,18 @@ def card_freed(result, done):
     return unloaded or answer == []
 
 
+def failed_keys(result):
+    """The consumers that answered with an error, for the action line."""
+    return [key for key, value in result.items()
+            if isinstance(value, dict) and value.get("error")]
+
+
+def failed_note(result):
+    """What the action line adds about the consumers that did not follow."""
+    stuck = failed_keys(result)
+    return f" ({', '.join(stuck)} did not follow)" if stuck else ""
+
+
 @app.post("/api/mode/{mode}")
 def set_mode(mode: str, _: str = Depends(require_auth)):
     global llm_blocked
@@ -2221,8 +2233,7 @@ def set_mode(mode: str, _: str = Depends(require_auth)):
                     f"Jellyfin on {accel_label(JELLYFIN_FALLBACK)}")
         # A consumer that did not move still holds the card: claiming the card is
         # free is how the operator ends up with an OOM instead of an error.
-        stuck = [key for key, value in result.items()
-                 if isinstance(value, dict) and value.get("error")]
+        stuck = failed_keys(result)
         llm_blocked = not stuck
         record_action(f"mode LLM: {', '.join(done) or 'nothing to move'}"
                       + (f" ({', '.join(stuck)} did not follow)" if stuck else " (card free for llama.cpp)"))
@@ -2237,7 +2248,7 @@ def set_mode(mode: str, _: str = Depends(require_auth)):
                     f"Jellyfin on {accel_label(JELLYFIN_ACCEL_GPU)}")
         state["jellyfin_before_llm"] = None
         llm_blocked = False
-        record_action(f"mode Media: {', '.join(done) or 'nothing to move'}")
+        record_action(f"mode Media: {', '.join(done) or 'nothing to move'}" + failed_note(result))
     elif mode == "balanced":
         if IMMICH:
             attempt(result, "immich_ml", lambda: immich_ml("start"), done, "Immich ML on")
@@ -2246,7 +2257,8 @@ def set_mode(mode: str, _: str = Depends(require_auth)):
                     f"Jellyfin on {accel_label(JELLYFIN_ACCEL_GPU)}")
         state["jellyfin_before_llm"] = None
         llm_blocked = False
-        record_action(f"mode Shared: {', '.join(done) or 'nothing to move'} (llama.cpp not unloaded)")
+        record_action(f"mode Shared: {', '.join(done) or 'nothing to move'} (llama.cpp not unloaded)"
+                      + failed_note(result))
     else:
         # Image generation needs the whole card: unload llama.cpp, stop the
         # Immich workload and move Jellyfin off (it keeps transcoding).
@@ -2263,7 +2275,7 @@ def set_mode(mode: str, _: str = Depends(require_auth)):
             attempt(result, "comfyui", lambda: comfy("start"), done,
                     "ComfyUI started with the card to itself")
         llm_blocked = False
-        record_action(f"mode Image: {', '.join(done) or 'nothing to move'}")
+        record_action(f"mode Image: {', '.join(done) or 'nothing to move'}" + failed_note(result))
     return result
 
 

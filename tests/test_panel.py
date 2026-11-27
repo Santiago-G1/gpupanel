@@ -1699,6 +1699,22 @@ def test_a_router_that_is_down_is_not_a_claimed_unload(panel):
     assert "unloaded" not in panel.state["last_action"]
 
 
+def test_the_action_line_names_the_consumer_that_did_not_follow(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, IMMICH_HOST="root@immich.test")
+    stub_gpu(panel, card())
+    panel.llama_loaded = lambda: []
+
+    def boom(action):
+        raise panel.HTTPException(502, "docker did not start it")
+
+    monkeypatch.setattr(panel, "immich_ml", boom)
+
+    panel.set_mode("media", "t")
+
+    # "nothing to move" was the record of a mode that tried and failed.
+    assert panel.state["last_action"] == "mode Media: nothing to move (immich_ml did not follow)"
+
+
 def test_an_unknown_mode_stops_nothing(monkeypatch, tmp_path):
     panel = load(monkeypatch, tmp_path, COMFY_CONTAINER="comfyui")
     calls = []
