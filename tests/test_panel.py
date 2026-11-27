@@ -487,6 +487,37 @@ def test_a_consumer_that_would_not_move_is_retried(monkeypatch, tmp_path):
     assert panel.llm_blocked is True
 
 
+def test_an_idle_unload_waits_for_a_second_reading(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path)
+    stub_gpu(panel, card(util="0"))
+    panel.state["llama_idle_min"] = 1
+    panel.llama_models = lambda: [{"id": "big", "status": "loaded"}]
+    unloaded = []
+    panel.llama_unload_all = lambda: unloaded.append(1) or [{"model": "big", "http": 200}]
+    panel.last_busy = time.time() - 3600
+
+    panel.auto_tick()
+    assert unloaded == []  # one quiet reading is not an idle card
+
+    panel.auto_tick()
+    assert unloaded == [1]
+
+
+def test_a_request_that_lands_while_the_tick_reads_is_not_idle(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path)
+    stub_gpu(panel, card(util="0"), card(util="0"))
+    panel.state["llama_idle_min"] = 1
+    panel.llama_models = lambda: [{"id": "big", "status": "loaded"}]
+    unloaded = []
+    panel.llama_unload_all = lambda: unloaded.append(1) or [{"model": "big", "http": 200}]
+    panel.last_busy = time.time() - 3600
+
+    panel.auto_tick()
+    # Somebody is using the card now: the second reading has to see it.
+    stub_gpu(panel, card(util="55"), card(util="0"))
+    panel.auto_tick()
+
+    assert unloaded == []
 # --- readings the card does not report --------------------------------------
 def test_na_readings_do_not_crash_the_status(panel):
     stub_gpu(panel, card(util="N/A", power_min="N/A", power_max="N/A", power_limit="N/A"))

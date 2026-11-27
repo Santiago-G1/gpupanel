@@ -348,6 +348,9 @@ llm_blocked = False
 # retry is spaced so a consumer host that is down is not SSH'd every tick.
 LLM_RETRY_SECONDS = 60
 last_llm_try = 0.0
+# Two consecutive idle readings before an unload, and a fresh one right before
+# it: a request that arrived while the tick was reading is not an idle card.
+idle_hits = 0
 # When each consumer was first seen up. Its idle timer counts from the card
 # going quiet *or* the consumer appearing, whichever is later: a ComfyUI started
 # on a card that had been idle for an hour is not idle the moment it starts.
@@ -999,6 +1002,19 @@ def gpu_status():
         probe_failing = False
         log.info("card probe answers again")
     return single_card(probe["cards"], probe)
+
+
+def card_is_busy():
+    """A fresh look at the cards, for the moment before an unload.
+
+    The tick reads the card once and then decides; a request that arrived while
+    that SSH ran has to count. A card host that does not answer is not proof of
+    use, so the router's own idle answer stands.
+    """
+    try:
+        return gpu_status()["util_max"] > 0
+    except HTTPException:
+        return False
 
 
 def llama_models():
@@ -1735,7 +1751,7 @@ def inventory_view(gpus, probe=None):
 
 # --- auto switch ---
 def auto_tick():
-    global last_busy, llm_blocked, last_llm_try
+    global last_busy, llm_blocked, last_llm_try, idle_hits
     gpu = gpu_status()
     # Before the switch logic and whatever it decides: the inventory has to be
     # kept even when the auto mode is off.
@@ -1807,23 +1823,34 @@ def auto_tick():
         if done:
             record_action(f"LLM in use: {', '.join(done)} (card free for llama.cpp)")
         if state["llama_idle_min"] and not loading and idle > state["llama_idle_min"] * 60:
-            unloaded = llama_unload_all()
-            if unloaded and not comfy_up:
-                back = []
-                with contextlib.suppress(HTTPException):
-                    if IMMICH:
-                        immich_ml("start")
-                        back.append("Immich ML on")
-                    if JELLYFIN:
-                        accel = jellyfin_reclaim_gpu().get("accel")
-                        back.append(f"Jellyfin back to {accel_label(accel)}")
-                llm_blocked = False
-                names = ", ".join(model_names([{"id": u["model"]} for u in unloaded]))
-                record_action(f"GPU idle {int(idle // 60)} min: unloaded {names}"
-                              f"{('; ' + ', '.join(back)) if back else ''}")
+            if card_is_busy():
+                # A request landed while this tick was reading: not idle.
+                last_busy = time.time()
+                idle_hits = 0
+            else:
+                idle_hits += 1
+            if idle_hits >= 2:
+                idle_hits = 0
+                unloaded = llama_unload_all()
+                if unloaded and not comfy_up:
+                    back = []
+                    with contextlib.suppress(HTTPException):
+                        if IMMICH:
+                            immich_ml("start")
+                            back.append("Immich ML on")
+                        if JELLYFIN:
+                            accel = jellyfin_reclaim_gpu().get("accel")
+                            back.append(f"Jellyfin back to {accel_label(accel)}")
+                    llm_blocked = False
+                    names = ", ".join(model_names([{"id": u["model"]} for u in unloaded]))
+                    record_action(f"GPU idle {int(idle // 60)} min: unloaded {names}"
+                                  f"{('; ' + ', '.join(back)) if back else ''}")
+        else:
+            idle_hits = 0
     else:
         llm_blocked = False
         last_llm_try = 0.0
+        idle_hits = 0
         # An idle ComfyUI hands the card back on its own.
         if comfy_up and state["comfy_idle_min"] and comfy_quiet > state["comfy_idle_min"] * 60:
             if comfy_release(f"ComfyUI idle {int(comfy_quiet // 60)} min: stopped, card free again"):
