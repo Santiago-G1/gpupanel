@@ -439,6 +439,54 @@ def test_a_just_started_immich_ml_is_not_idle(monkeypatch, tmp_path):
     assert stopped == []
 
 
+def test_a_router_that_does_not_answer_is_not_a_card_with_no_models(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, COMFY_CONTAINER="comfyui")
+    stub_gpu(panel, card(util="0"))
+    panel.llama_models = lambda: (_ for _ in ()).throw(RuntimeError("connection refused"))
+    monkeypatch.setattr(panel, "comfy_state", lambda: "running")
+    stopped = []
+    monkeypatch.setattr(panel, "comfy_release", lambda why=None: stopped.append(why) or True)
+    panel.state["comfy_idle_min"] = 1
+    panel.last_busy = time.time() - 3600
+    panel.CONSUMERS["comfyui"].update({"up": True, "since": time.time() - 3600})
+
+    panel.auto_tick()
+
+    # The idle ComfyUI would be stopped on a reading of "no models loaded":
+    # one failed request to the router is not that reading.
+    assert stopped == []
+    assert panel.state["last_action"] is None
+
+
+def test_a_consumer_that_would_not_move_is_retried(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, IMMICH_HOST="root@immich.test")
+    stub_gpu(panel, card(util="90"))
+    panel.llama_models = lambda: [{"id": "big", "status": "loaded"}]
+    calls = []
+
+    def stop(action):
+        calls.append(action)
+        if len(calls) == 1:
+            raise panel.HTTPException(400, "docker did not stop it")
+        return {"action": action, "ok": True}
+
+    monkeypatch.setattr(panel, "immich_ml", stop)
+
+    panel.auto_tick()
+    assert panel.llm_blocked is False
+    assert panel.state["last_action"] == "LLM in use: Immich ML still on the card, retrying"
+
+    # Inside the retry window it is not tried again, so a consumer host that is
+    # down is not SSH'd every tick.
+    panel.auto_tick()
+    assert calls == ["stop"]
+
+    panel.last_llm_try = 0
+    panel.auto_tick()
+    assert calls == ["stop", "stop"]
+    assert panel.llm_blocked is True
+
+
 # --- readings the card does not report --------------------------------------
 def test_na_readings_do_not_crash_the_status(panel):
     stub_gpu(panel, card(util="N/A", power_min="N/A", power_max="N/A", power_limit="N/A"))

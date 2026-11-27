@@ -343,6 +343,11 @@ EVIDENCE_GATE = threading.Lock()
 PROBE_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="probe")
 last_busy = time.time()
 llm_blocked = False
+# A consumer that would not move is retried, not latched: one failed `docker
+# stop` used to mean hours of Immich ML on the same card as llama.cpp. The
+# retry is spaced so a consumer host that is down is not SSH'd every tick.
+LLM_RETRY_SECONDS = 60
+last_llm_try = 0.0
 # When each consumer was first seen up. Its idle timer counts from the card
 # going quiet *or* the consumer appearing, whichever is later: a ComfyUI started
 # on a card that had been idle for an hour is not idle the moment it starts.
@@ -1730,7 +1735,7 @@ def inventory_view(gpus, probe=None):
 
 # --- auto switch ---
 def auto_tick():
-    global last_busy, llm_blocked
+    global last_busy, llm_blocked, last_llm_try
     gpu = gpu_status()
     # Before the switch logic and whatever it decides: the inventory has to be
     # kept even when the auto mode is off.
@@ -1749,11 +1754,15 @@ def auto_tick():
 
     try:
         models = llama_models()
-    except Exception:
-        models = []
+    except Exception as exc:  # noqa: BLE001 - a failed read is not an observation
+        # The router is down or refusing: "no models" would make every branch
+        # below act on a card it cannot see (the same rule `/api/status` fixed).
+        log.warning("auto: could not read the models: %s", exc)
+        return
     # "loading" counts as in use: the router asks for the VRAM before the status
     # reads "loaded", and a 13.6 GB model does not fit next to ComfyUI.
     in_use = [m for m in models if str(m.get("status", "")).lower().startswith("load")]
+    loading = [m for m in in_use if str(m.get("status", "")).lower() != "loaded"]
 
     comfy_up = False
     with contextlib.suppress(Exception):
@@ -1766,7 +1775,8 @@ def auto_tick():
         if comfy_up and comfy_release():
             comfy_up = False
             done.append("ComfyUI stopped")
-        if not llm_blocked:
+        if not llm_blocked and time.time() - last_llm_try >= LLM_RETRY_SECONDS:
+            last_llm_try = time.time()
             # Immich ML cannot share the card, and Jellyfin keeps transcoding on
             # whatever device the fallback names. Each one is tried on its own:
             # the first failing must not keep the second from moving.
@@ -1796,7 +1806,7 @@ def auto_tick():
         # tick still happened, and the last-action line is the only record of it.
         if done:
             record_action(f"LLM in use: {', '.join(done)} (card free for llama.cpp)")
-        if state["llama_idle_min"] and idle > state["llama_idle_min"] * 60:
+        if state["llama_idle_min"] and not loading and idle > state["llama_idle_min"] * 60:
             unloaded = llama_unload_all()
             if unloaded and not comfy_up:
                 back = []
@@ -1813,6 +1823,7 @@ def auto_tick():
                               f"{('; ' + ', '.join(back)) if back else ''}")
     else:
         llm_blocked = False
+        last_llm_try = 0.0
         # An idle ComfyUI hands the card back on its own.
         if comfy_up and state["comfy_idle_min"] and comfy_quiet > state["comfy_idle_min"] * 60:
             if comfy_release(f"ComfyUI idle {int(comfy_quiet // 60)} min: stopped, card free again"):
