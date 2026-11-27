@@ -1006,17 +1006,29 @@ def llama_models():
 
 
 def llama_loaded():
-    return [m for m in llama_models() if m["status"] == "loaded"]
+    """Models holding the card: `loading` included.
+
+    The router asks for the VRAM before it reports `loaded`, and a model on its
+    way in is not a free card: `/api/llama/unload` used to answer an empty list
+    and the dashboard said "Models unloaded" over 8 GB of them.
+    """
+    return [m for m in llama_models() if str(m.get("status", "")).lower().startswith("load")]
 
 
 def llama_unload_all():
     """Unload every resident model. A refusal is an error, not an unload.
 
     `POST /models/unload` answered 404/500 used to be counted as done, and the
-    caller then announced a freed card that still held 15 GB.
+    caller then announced a freed card that still held 15 GB. A model that is
+    still `loading` cannot be unloaded; it is reported as a 409, which the mode
+    and the dashboard both read as "the card is not free yet".
     """
+    resident = llama_loaded()
+    waiting = [m["id"] for m in resident if m["status"] != "loaded"]
     out, refused = [], []
-    for m in llama_loaded():
+    for m in resident:
+        if m["status"] != "loaded":
+            continue
         r = llama_request("POST", "/models/unload", json={"model": m["id"]}, timeout=60)
         if 200 <= r.status_code < 300:
             out.append({"model": m["id"], "http": r.status_code})
@@ -1026,7 +1038,28 @@ def llama_unload_all():
         log.warning("the router did not unload %s",
                     ", ".join(f"{m['model']} ({m['http']})" for m in refused))
         raise HTTPException(502, f"the router did not unload {len(refused)} model(s)")
+    if waiting:
+        raise HTTPException(409, f"the router is still loading {len(waiting)} model(s)")
     return out
+
+
+def llama_holding_card():
+    """Whether a llama.cpp process still holds memory on a card.
+
+    Only for the case where the router does not answer: a router that is down is
+    not a router with no model, and its child keeps the 15 GB. `None` means the
+    card could not be read, and then nothing is refused on a guess.
+    """
+    try:
+        cards = gpu_status()["gpus"]
+    except HTTPException:
+        return None
+    for card in cards:
+        for proc in card.get("processes") or []:
+            name = str(proc.get("name") or "").lower()
+            if "llama" in name and int(proc.get("mem_mib") or 0) > 1024:
+                return True
+    return False
 
 
 def llama_logs(lines=200):
@@ -2095,10 +2128,11 @@ def card_freed(result, done):
     unloaded = unload_models(result, done)
     answer = result.get("llama")
     if isinstance(answer, dict) and answer.get("error"):
-        # A router that is not answering is not holding anything the panel can
-        # see, and refusing the mode there would be a regression: only a refusal
-        # is proof that the card is still occupied.
-        return bool(answer.get("unreachable"))
+        if not answer.get("unreachable"):
+            return False
+        # A router that does not answer is not proof of anything, but its child
+        # keeps the VRAM: read the card before starting a consumer on top.
+        return llama_holding_card() is not True
     return unloaded or answer == []
 
 

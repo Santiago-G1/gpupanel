@@ -266,6 +266,46 @@ def test_an_unload_the_router_refused_is_an_error(panel):
     assert exc.value.status_code == 502
 
 
+def test_a_model_still_loading_is_not_an_empty_card(panel):
+    # Live case: status "loading" with 8 GB already allocated. Answering an
+    # empty unload made the dashboard print "Models unloaded".
+    panel.llama_loaded = lambda: [{"id": "big", "status": "loading"}]
+    posted = []
+    panel.llama_request = lambda *a, **kw: posted.append(a) or Reply(200)
+
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.llama_unload_all()
+
+    assert exc.value.status_code == 409
+    assert posted == []  # nothing to POST: the router is still loading it
+
+
+def test_media_mode_refuses_a_card_whose_model_is_still_loading(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, IMMICH_HOST="root@immich.test")
+    stub_gpu(panel, card())
+    panel.llama_loaded = lambda: [{"id": "big", "status": "loading"}]
+    started = []
+    monkeypatch.setattr(panel, "immich_ml", lambda action: started.append(action) or {"ok": True})
+
+    out = panel.set_mode("media", "t")
+
+    assert started == []
+    assert "still loading" in out["llama"]["error"]
+
+
+def test_a_router_that_is_down_but_still_holds_the_card_blocks_the_mode(monkeypatch, tmp_path):
+    # The child outlives the router: 8 GB on GPU 0 and no /v1/models answer.
+    panel = load(monkeypatch, tmp_path, IMMICH_HOST="root@immich.test")
+    stub_gpu(panel, card(processes=[{"pid": "42", "name": "llama-server", "mem_mib": 8216}]))
+    panel.llama_loaded = lambda: (_ for _ in ()).throw(RuntimeError("connection refused"))
+    started = []
+    monkeypatch.setattr(panel, "immich_ml", lambda action: started.append(action) or {"ok": True})
+
+    panel.set_mode("media", "t")
+
+    assert started == []
+
+
 def test_image_mode_does_not_start_comfyui_when_the_router_refuses(monkeypatch, tmp_path):
     panel = load(monkeypatch, tmp_path, COMFY_CONTAINER="comfyui")
     stub_gpu(panel, card())
