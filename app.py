@@ -1518,16 +1518,17 @@ def gpu_evidence():
     `Xid 79` is a card that fell off the bus, an `amdgpu` ring reset is a driver
     that gave up, and `pcieport` AER lines are the link: the panel cannot fix
     any of it, but it cannot call them the same thing either. One SSH, and only
-    when something actually changed, and never two of them at once: the event is
-    written whether or not the lines arrive.
+    when something actually changed, and never two of them at once. `None` means
+    another caller is already asking: its lines are the same and its write is
+    the one that carries them, so this one must not record an empty event.
     """
     if not GPU_EVIDENCE:
         return []
     if not EVIDENCE_GATE.acquire(False):
-        # Another caller is already asking: its lines describe the same ten
-        # minutes, and a queue of 20-second SSH calls on a dying host is worse
-        # than an event without them.
-        return []
+        # A queue of 20-second SSH calls on a dying host is worse than one event
+        # without kernel lines, but overwriting the caller that has them is worse
+        # still.
+        return None
     try:
         p = ssh(
             GPU_HOST,
@@ -1611,6 +1612,10 @@ def track_gpus(gpus):
         seq = state.get("gpus_seq") or 0
 
     evidence = gpu_evidence()
+    if evidence is None:
+        # Another caller is holding the kernel query for this same change: it
+        # writes the event, with the `Xid` lines that make it diagnosable.
+        return
 
     with STATE_LOCK:
         if (state.get("gpus_seq") or 0) != seq:

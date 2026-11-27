@@ -2063,7 +2063,7 @@ def test_the_evidence_ssh_does_not_pile_up(panel):
     # of queueing a second one behind it on a host whose card is falling off.
     assert panel.EVIDENCE_GATE.acquire(False)
     try:
-        assert panel.gpu_evidence() == []
+        assert panel.gpu_evidence() is None
         assert calls == []
     finally:
         panel.EVIDENCE_GATE.release()
@@ -2073,21 +2073,28 @@ def test_the_evidence_ssh_does_not_pile_up(panel):
     assert len(calls) == 1
 
 
-def test_a_change_is_recorded_even_when_the_evidence_is_busy(panel):
+def test_a_change_the_other_caller_is_recording_is_not_written_twice(panel):
     board = [{"uuid": "GPU-1111-2222", "name": "Tesla P100", "pci": "0000:01:00.0", "index": "0"}]
     panel.track_gpus(board)
     calls = []
-    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc()
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc("NVRM: Xid 79\n")
 
     assert panel.EVIDENCE_GATE.acquire(False)
     try:
-        panel.track_gpus([])  # the evidence is busy: the event is still written
+        # The other caller is already asking for the kernel lines: writing the
+        # event here would replace theirs with an empty one, and the `Xid` that
+        # explains the loss is what gets dropped.
+        panel.track_gpus([])
     finally:
         panel.EVIDENCE_GATE.release()
 
     assert calls == []
+    assert panel.state["gpus_events"] == []
+
+    # The caller that holds the gate writes it, with the lines.
+    panel.track_gpus([])
     event = panel.state["gpus_events"][-1]
-    assert (event["kind"], event["evidence"]) == ("removed", [])
+    assert (event["kind"], event["evidence"]) == ("removed", ["NVRM: Xid 79"])
 
 
 # --- Jellyfin left stopped ------------------------------------------------
