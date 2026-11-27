@@ -125,8 +125,10 @@ a consistent state and records the action in the state file.
 | `image` | unloaded | stopped | the fallback device | started |
 
 `media` and `image` unload llama.cpp first, and only then start a consumer: a
-router that is down or that refuses the unload still holds the VRAM, so the mode
-answers with that instead of starting ComfyUI on top of it.
+model that is `loading` or one the router refuses to unload still holds the
+VRAM, so the mode answers with that instead of starting ComfyUI on top of it. A
+router that does not answer at all is checked against the cards: if a
+`llama-server` process is still holding memory, the mode refuses too.
 
 `balanced` is the only one that deliberately leaves the card oversubscribed: it
 is for a small LLM next to Immich's face detection, and it is the one that can
@@ -251,7 +253,7 @@ it usable from scripts.
 
 | Endpoint | Method | What it does |
 | --- | --- | --- |
-| `/api/health` | GET | `ok`, `probe_ok` and the card count, answered from the last card probe and with no SSH of its own. **No auth**, because the container's own healthcheck is the caller: it says whether the panel can still see the card host. |
+| `/api/health` | GET | `ok`, `probe_ok`, `cards`, `expected` and `router_ok`, answered from the last card probe and with no SSH of its own. **No auth**, because the container's own healthcheck is the caller: it says whether the panel can still see the card host. `router_ok` is the last `/v1/models` read: a router that is down makes every reading stale, but it is not the card host being gone, so it does not change the status code. |
 | `/api/session` | GET | Who the caller is. The only probe that never leaves the container. |
 | `/api/status` | GET | Every card the host reports, the processes on them attributed by UUID, `inventory` (cards vs expected), `configured` (which consumers exist here), `auto`, Immich, Jellyfin, the router's models, the folder's models and ComfyUI's stats. |
 | `/api/mode/{llm,media,balanced,image}` | POST | The table above. |
@@ -259,7 +261,7 @@ it usable from scripts.
 | `/api/power` | POST | The vendor's own command per card (`nvidia-smi -i <index> -pl`, `amd-smi set --power-cap`), bounded by what the cards report. `{"watts": 175}` is the single slider; `{"cards": [{"index": 0, "watts": 150}]}` changes one card at a time, each checked against its own range. The answer says which ones refused and which ones a vendor exposes no limit for. |
 | `/api/power/factory` | POST | Every settable card back to its own `power.default_limit` (the manufacturer's value, not the cap a host boots with), and the saved limits are forgotten. |
 | `/api/reset` | POST | The panel's own defaults back: timers, auto-switch, and no saved power limits. The cards are left where they are. |
-| `/api/llama/unload` | POST | Unload every resident model. |
+| `/api/llama/unload` | POST | Unload every resident model. `409` when one is still `loading`: the router will not unload it and the card is not free yet. |
 | `/api/llama/logs?lines=200` | GET | `journalctl` of the unit on `AI_HOST` (through `pct exec` when `AI_CTID` is set), capped at 2000 lines. |
 | `/api/comfy/{start,stop,restart}` | POST | The ComfyUI container on `AI_HOST`; skipped when `COMFY_CONTAINER` is empty. |
 | `/api/immich/ml/{start,stop,restart}` | POST | `IMMICH_ML_CONTAINER` on `IMMICH_HOST`; skipped when it is not configured. |
@@ -347,8 +349,9 @@ router is still loading: they already hold the VRAM, so the dashboard treats
 them as in use. A consumer that is not configured answers
 `"unconfigured"` instead of an object, so a client can tell it apart from a
 consumer that is down. `disk_models` is `[]` until `LLAMA_MODELS_DIR` is set,
-and `{"error": …}` when the folder cannot be read; `served` and `loaded` are
-`false` for every row while the router does not answer.
+and `{"error": …}` when the folder cannot be read; a failure is remembered for
+30 s, so a broken mount does not add its 8-second `find` to every poll. `served`
+and `loaded` are `false` for every row while the router does not answer.
 
 Each `disk_models` row is a `*.gguf` file one level inside the folder. `size` is
 the size of the file the name points at, not of the link: the listing is made
@@ -368,7 +371,8 @@ them as models. The dashboard marks a row `●` loaded (which includes
 | `PANEL_USER` | `admin` | |
 | `SESSION_TTL` | `604800` | Seconds. |
 | `LOGIN_DELAY` | `0.4` | Seconds burned on a bad password. |
-| `LOGIN_MAX_FAILURES` | `5` | Failed logins from one address before the answer is `429`. Behind a reverse proxy the address is the last `X-Forwarded-For` hop, which is the one the proxy wrote. `0` disables it. |
+| `LOGIN_MAX_FAILURES` | `5` | Failed logins from one address before the answer is `429`. `0` disables it. |
+| `TRUSTED_PROXIES` | empty | Comma-separated addresses of the reverse proxy in front. Only then is `X-Forwarded-For` believed, right to left, and the first address that is not a proxy is the client. Empty means the header is ignored: any client that reaches the panel directly writes it. |
 | `LOGIN_WINDOW` | `300` | Seconds the failures are counted over. |
 | `STATE_PATH` | `/state/auto.json` | Inside the container; the Compose file bind-mounts `./state` there. |
 | `AI_HOST` | `GPU_HOST` | Where llama.cpp and ComfyUI run. |
@@ -398,7 +402,7 @@ The Compose file itself reads four variables that `app.py` never sees:
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `PUBLISH_ADDR` | `0.0.0.0` | Address the port is published on. `127.0.0.1` keeps the panel off the LAN, which is what you want behind a reverse proxy. |
+| `PUBLISH_ADDR` | `0.0.0.0` | Address the port is published on. `127.0.0.1` keeps the panel off the LAN, which is what you want behind a proxy on the same host; a proxy on another host needs that host's address **and** a firewall rule. |
 | `PUBLISH_PORT` | — | **Required.** Host port mapped to the container's 8099. |
 | `SSH_PATH` | `/root/.ssh` | Directory mounted read-only as the container's `/root/.ssh`. The container runs as root for this mount alone. |
 | `TZ` | `Etc/UTC` | |
