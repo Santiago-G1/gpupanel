@@ -1878,8 +1878,8 @@ def login_failed(where):
         LOGIN_FAILURES.setdefault(where, []).append(time.time())
 
 
-@app.post("/api/login")
-def login(request: Request, body: dict = Body(...)):
+def login(request: Request, body: dict):
+    """The login decision, without the delay: the endpoint awaits it."""
     where = client_key(request)
     if login_throttled(where):
         raise HTTPException(429, "too many failed logins, try again later")
@@ -1888,7 +1888,6 @@ def login(request: Request, body: dict = Body(...)):
     ok = bool(PANEL_PASSWORD) and same_text(user, PANEL_USER) and same_text(password, PANEL_PASSWORD)
     if not ok:
         login_failed(where)
-        time.sleep(LOGIN_DELAY)
         raise HTTPException(401, "wrong user or password")
     with LOGIN_LOCK:
         LOGIN_FAILURES.pop(where, None)
@@ -1903,6 +1902,18 @@ def login(request: Request, body: dict = Body(...)):
         path="/",
     )
     return response
+
+
+@app.post("/api/login")
+async def login_endpoint(request: Request, body: dict = Body(...)):
+    try:
+        return login(request, body)
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            # Awaited, not slept: a sync handler holds a threadpool worker, and
+            # bad guesses would queue every SSH probe behind them.
+            await asyncio.sleep(LOGIN_DELAY)
+        raise
 
 
 @app.post("/api/logout")
