@@ -1111,7 +1111,11 @@ def llama_logs(lines=200):
 # polls /api/status every five. Same shape as COMFY_STATE: a value and when it
 # was read, and a caller that can force it.
 DISK_STATE_TTL = 30
-DISK_STATE = {"at": 0.0, "value": None}
+# A folder that cannot be read costs the whole `find` (8 s, `pct exec` included)
+# and the poll happens every five: remembering the failure is what keeps a
+# broken mount from answering the dashboard eight seconds late forever.
+DISK_FAIL_TTL = 30
+DISK_STATE = {"at": 0.0, "value": None, "error": None}
 
 
 def models_on_disk(force=False):
@@ -1122,11 +1126,15 @@ def models_on_disk(force=False):
 
     One SSH round trip per cache window: /api/status is polled every five
     seconds and this is a full second of it, while the folder changes at the
-    speed of a `cp`. Failures are not cached, so a folder that comes back is
-    seen on the next poll.
+    speed of a `cp`. A failure is remembered for its own, shorter window: it is
+    the same 8 s and a folder that comes back is seen within half a minute.
     """
-    if not force and DISK_STATE["value"] is not None and time.time() - DISK_STATE["at"] < DISK_STATE_TTL:
-        return DISK_STATE["value"]
+    if not force and time.time() - DISK_STATE["at"] < (
+            DISK_FAIL_TTL if DISK_STATE["error"] else DISK_STATE_TTL):
+        if DISK_STATE["error"]:
+            raise RuntimeError(DISK_STATE["error"])
+        if DISK_STATE["value"] is not None:
+            return DISK_STATE["value"]
     command = (
         f"find -L {shlex.quote(LLAMA_MODELS_DIR)} -maxdepth 1 -type f -name '*.gguf' "
         "-printf '%f\\t%s\\t%T@\\n'"
@@ -1157,11 +1165,12 @@ def models_on_disk(force=False):
         if not rows:
             log.warning("models folder: could not read %s: %s", LLAMA_MODELS_DIR,
                         (p.stderr or p.stdout).strip()[:500])
+            DISK_STATE.update({"at": time.time(), "value": None, "error": "could not read the models folder"})
             raise RuntimeError("could not read the models folder")
         log.debug("find -L %s exited %s: %s", LLAMA_MODELS_DIR, p.returncode,
                   (p.stderr or p.stdout).strip())
     models.sort(key=lambda m: m["id"])
-    DISK_STATE.update({"at": time.time(), "value": models})
+    DISK_STATE.update({"at": time.time(), "value": models, "error": None})
     return models
 
 
@@ -1224,7 +1233,10 @@ def immich_ml_state():
 # container: `pct exec` plus `docker inspect` is over a second, and a container
 # does not change state between two dashboard polls. Actions force it.
 COMFY_STATE_TTL = 15
-COMFY_STATE = {"at": 0.0, "value": None}
+# A container that is not there at all is not news every 15 s: each look is a
+# `pct exec` of over a second, and the answer only changes when it is created.
+COMFY_UNKNOWN_TTL = 120
+COMFY_STATE = {"at": 0.0, "value": None, "ttl": COMFY_STATE_TTL}
 
 
 def comfy_state(force=False):
@@ -1239,16 +1251,17 @@ def comfy_state(force=False):
     if COMFY_API:
         try:
             httpx.get(f"{COMFY_URL}/system_stats", timeout=3)
-            COMFY_STATE.update({"at": time.time(), "value": "running"})
+            COMFY_STATE.update({"at": time.time(), "value": "running", "ttl": COMFY_STATE_TTL})
             return "running"
         except Exception:  # noqa: BLE001 - not answering: ask the container
             pass
     now = time.time()
-    if not force and COMFY_STATE["value"] and now - COMFY_STATE["at"] < COMFY_STATE_TTL:
+    if not force and COMFY_STATE["value"] and now - COMFY_STATE["at"] < COMFY_STATE["ttl"]:
         return COMFY_STATE["value"]
     p = ssh(AI_HOST, ai_cmd(f"docker inspect -f '{{{{.State.Status}}}}' {COMFY_CONTAINER}"))
     value = p.stdout.strip() or "unknown"
-    COMFY_STATE.update({"at": now, "value": value})
+    ttl = COMFY_STATE_TTL if value != "unknown" else COMFY_UNKNOWN_TTL
+    COMFY_STATE.update({"at": now, "value": value, "ttl": ttl})
     return value
 
 

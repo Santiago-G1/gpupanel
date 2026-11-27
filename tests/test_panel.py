@@ -1825,6 +1825,24 @@ def test_a_stopped_comfyui_is_not_asked_twice_in_a_row(monkeypatch, tmp_path):
     assert len(calls) == 2
 
 
+def test_a_comfyui_that_does_not_exist_is_not_looked_for_every_15_s(monkeypatch, tmp_path):
+    # The live case: COMFY_CONTAINER names a container that is not there, and
+    # every look is a `pct exec` of over a second on the path of the poll.
+    panel = load(monkeypatch, tmp_path, COMFY_CONTAINER="comfyui", COMFY_URL="http://comfy.test")
+
+    def no_api(*args, **kwargs):
+        raise RuntimeError("ComfyUI is stopped")
+
+    monkeypatch.setattr(panel.httpx, "get", no_api)
+    calls = []
+    panel.ssh = lambda host, command, timeout=30: calls.append(command) or Proc("")
+
+    assert panel.comfy_state() == "unknown"
+    assert panel.COMFY_STATE["ttl"] == panel.COMFY_UNKNOWN_TTL
+    assert panel.comfy_state() == "unknown"
+    assert len(calls) == 1
+
+
 # --- the boot-time restore --------------------------------------------------
 def test_the_restore_waits_for_the_cards_to_appear(panel):
     # The 250 W bug: the driver is still loading, the probe answers with no
@@ -2171,17 +2189,30 @@ def test_the_models_folder_is_read_once_per_window(monkeypatch, tmp_path):
     assert len(calls) == 2
 
 
-def test_a_folder_that_failed_is_not_remembered(monkeypatch, tmp_path):
+def test_a_folder_that_failed_is_remembered_briefly(monkeypatch, tmp_path):
     panel = load(monkeypatch, tmp_path, LLAMA_MODELS_DIR="/mnt/models")
     answers = [Proc(returncode=1, stderr="find: '/mnt/models': No such file or directory"),
                Proc("a.gguf\t1\t1\n")]
+    calls = []
 
-    panel.ssh = lambda host, command, timeout=30: answers.pop(0)
+    def ssh(host, command, timeout=30):
+        calls.append(command)
+        return answers.pop(0)
+
+    panel.ssh = ssh
 
     with pytest.raises(RuntimeError):
         panel.models_on_disk()
-    # A folder that appears is seen on the next poll, not thirty seconds later.
+    # The same 8 s `find` is not paid again on the next poll: a broken mount
+    # used to answer every request eight seconds late.
+    with pytest.raises(RuntimeError):
+        panel.models_on_disk()
+    assert len(calls) == 1
+
+    # Half a minute later the folder is read again, and it is there.
+    panel.DISK_STATE["at"] -= panel.DISK_FAIL_TTL + 1
     assert panel.models_on_disk() == [{"id": "a", "size": 1, "mtime": 1}]
+    assert len(calls) == 2
 
 
 # --- a reset is not a logout ------------------------------------------------
