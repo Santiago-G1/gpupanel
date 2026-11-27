@@ -56,6 +56,10 @@ class Reply:
     def json(self):
         return self.body
 
+    def raise_for_status(self):
+        if not self.is_success:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
 
 def card(**overrides):
     one = dict(CARD, **overrides)
@@ -1958,7 +1962,7 @@ def test_health_is_the_last_card_probe(panel):
     assert (body["ok"], body["probe_ok"], body["cards"]) == (True, True, 1)
     # No age: the seconds since the last probe move with the dashboard being
     # open, and that is the operator's business, not a stranger's.
-    assert set(body) == {"ok", "probe_ok", "cards"}
+    assert set(body) == {"ok", "probe_ok", "cards", "expected", "router_ok"}
 
 
 def test_health_is_503_when_the_probe_could_not_reach_the_host(panel):
@@ -2247,3 +2251,20 @@ def test_a_reset_does_not_hand_a_revoked_session_back(panel):
 
     assert panel.state["llama_idle_min"] == 60
     assert panel.state["revoked"] == {"nonce": 9999999999}
+
+
+def test_health_says_when_the_router_is_not_answering(panel):
+    panel.PROBE_STATE.update({"at": time.time(), "ok": True, "cards": 2})
+
+    def down(*args, **kwargs):
+        raise RuntimeError("connection refused")
+
+    panel.llama_request = down
+    with pytest.raises(RuntimeError):
+        panel.llama_models()
+    body = json.loads(panel.health().body)
+    assert (body["ok"], body["router_ok"], body["cards"]) == (True, False, 2)
+
+    panel.llama_request = lambda *a, **kw: Reply(200, {"data": [{"id": "m", "status": {"value": "loaded"}}]})
+    panel.llama_models()
+    assert json.loads(panel.health().body)["router_ok"] is True

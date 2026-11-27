@@ -343,6 +343,8 @@ EVIDENCE_GATE = threading.Lock()
 PROBE_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="probe")
 last_busy = time.time()
 llm_blocked = False
+# Whether the last read of `/v1/models` worked: what `/api/health` publishes.
+router_ok = True
 # A consumer that would not move is retried, not latched: one failed `docker
 # stop` used to mean hours of Immich ML on the same card as llama.cpp. The
 # retry is spaced so a consumer host that is down is not SSH'd every tick.
@@ -1026,12 +1028,25 @@ def card_is_busy():
 
 
 def llama_models():
-    r = llama_request("GET", "/v1/models")
-    r.raise_for_status()
-    return [
-        {"id": m.get("id"), "status": (m.get("status") or {}).get("value", "unknown")}
-        for m in r.json().get("data", [])
-    ]
+    """Every model the router serves, with its status.
+
+    The last answer is remembered as a flag: `/api/health` can then say that the
+    router is not answering without an SSH or a second request on the path of
+    the container healthcheck.
+    """
+    global router_ok
+    try:
+        r = llama_request("GET", "/v1/models")
+        r.raise_for_status()
+        models = [
+            {"id": m.get("id"), "status": (m.get("status") or {}).get("value", "unknown")}
+            for m in r.json().get("data", [])
+        ]
+    except Exception:
+        router_ok = False
+        raise
+    router_ok = True
+    return models
 
 
 def llama_loaded():
@@ -2057,6 +2072,11 @@ def health():
             "ok": fresh,
             "probe_ok": bool(PROBE_STATE["ok"]),
             "cards": PROBE_STATE["cards"],
+            # The card host is liveness; the router is not. A router restart
+            # makes the dashboard stale, and saying so without turning the
+            # container unhealthy on every model switch is the honest line.
+            "expected": GPU_EXPECTED,
+            "router_ok": router_ok,
         },
         status_code=200 if fresh else 503,
     )
