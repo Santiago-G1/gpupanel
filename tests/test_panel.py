@@ -1570,7 +1570,8 @@ def test_guessing_the_password_stops(panel):
     assert exc.value.status_code == 429
 
 
-def test_the_login_limit_follows_the_proxy(panel):
+def test_the_login_limit_follows_the_proxy(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, TRUSTED_PROXIES="192.168.10.104")
     proxy = types.SimpleNamespace(host="192.168.10.104")
     for _ in range(5):
         with pytest.raises(panel.HTTPException):
@@ -1586,6 +1587,23 @@ def test_the_login_limit_follows_the_proxy(panel):
     # The address that did guess is the one that waits.
     with pytest.raises(panel.HTTPException) as exc:
         panel.login(request(client=proxy, headers={"x-forwarded-for": "203.0.113.9"}),
+                    {"user": "admin", "password": "nope"})
+    assert exc.value.status_code == 429
+
+
+def test_a_direct_client_cannot_write_its_own_login_bucket(monkeypatch, tmp_path):
+    # The panel is reachable on the LAN as well as through the proxy: there the
+    # header is the caller's own text, and a fresh address per guess would make
+    # the limit unreachable.
+    panel = load(monkeypatch, tmp_path, TRUSTED_PROXIES="192.168.10.104")
+    peer = types.SimpleNamespace(host="192.168.10.95")
+    for n in range(5):
+        with pytest.raises(panel.HTTPException):
+            panel.login(request(client=peer, headers={"x-forwarded-for": f"10.9.9.{n}"}),
+                        {"user": "admin", "password": "nope"})
+
+    with pytest.raises(panel.HTTPException) as exc:
+        panel.login(request(client=peer, headers={"x-forwarded-for": "10.9.9.99"}),
                     {"user": "admin", "password": "nope"})
     assert exc.value.status_code == 429
 

@@ -41,6 +41,8 @@ services:
       - LOGIN_DELAY=${LOGIN_DELAY:-0.4}
       - LOGIN_MAX_FAILURES=${LOGIN_MAX_FAILURES:-5}
       - LOGIN_WINDOW=${LOGIN_WINDOW:-300}
+      # Whose X-Forwarded-For is believed: the reverse proxy in front, if any.
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
       # Where the settings live: the bind mount below puts /state on ./state.
       - STATE_PATH=${STATE_PATH:-/state/auto.json}
       # llama.cpp and ComfyUI: the host they run on, and optionally the Proxmox

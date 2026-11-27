@@ -115,6 +115,9 @@ PANEL_TOKEN = required("PANEL_TOKEN")
 SESSION_COOKIE = optional("SESSION_COOKIE") or "panel_session"
 SESSION_TTL = number("SESSION_TTL", 7 * 24 * 3600)
 LOGIN_DELAY = number("LOGIN_DELAY", 0.4, float)
+# Addresses whose `X-Forwarded-For` is believed. Empty means none: a client that
+# reaches the panel directly writes that header itself.
+TRUSTED_PROXIES = [p.strip() for p in (optional("TRUSTED_PROXIES") or "").split(",") if p.strip()]
 STATE_PATH = optional("STATE_PATH") or "/state/auto.json"
 
 # --- the consumers, each one optional ---
@@ -1844,11 +1847,19 @@ def client_key(request):
     counting by the peer alone let five bad passwords lock every browser out
     for the whole window. The proxy appends the address it saw as the *last*
     forwarded entry: anything to its left is the client's own text, and the
-    last one cannot be written by the client.
+    last one cannot be written by the client. Only a configured proxy is
+    believed at all: the panel is reachable directly too.
     """
     peer = getattr(getattr(request, "client", None), "host", None) or "unknown"
+    if peer not in TRUSTED_PROXIES:
+        return peer
     hops = [hop.strip() for hop in request.headers.get("x-forwarded-for", "").split(",") if hop.strip()]
-    return hops[-1] if hops else peer
+    # Right to left, skipping the proxies: the first address that is not one of
+    # ours is the client, and everything left of it is the client's own text.
+    for hop in reversed(hops):
+        if hop not in TRUSTED_PROXIES:
+            return hop
+    return peer
 
 
 def login_throttled(where):
