@@ -1920,11 +1920,14 @@ async def login_endpoint(request: Request, body: dict = Body(...)):
 def logout(request: Request):
     payload = session_payload(request)
     if payload.get("n"):
-        # Sessions are stateless, so logout has to remember the nonce.
-        revoked = {n: exp for n, exp in state.get("revoked", {}).items() if int(exp) > time.time()}
-        revoked[str(payload["n"])] = int(payload.get("exp") or time.time())
-        state["revoked"] = revoked
-        save_state()
+        # Sessions are stateless, so logout has to remember the nonce. Under the
+        # lock, like every other writer: two logouts used to drop one nonce and
+        # that cookie stayed valid for a week.
+        with STATE_LOCK:
+            revoked = {n: exp for n, exp in state.get("revoked", {}).items() if int(exp) > time.time()}
+            revoked[str(payload["n"])] = int(payload.get("exp") or time.time())
+            state["revoked"] = revoked
+            save_state()
     response = JSONResponse({"ok": True})
     response.delete_cookie(SESSION_COOKIE, path="/")
     return response

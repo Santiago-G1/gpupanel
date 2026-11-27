@@ -1127,6 +1127,20 @@ def test_logout_revokes_the_nonce(panel, tmp_path):
     assert panel.session_payload(request(cookies={panel.SESSION_COOKIE: cookie})) == {}
 
 
+def test_a_logout_keeps_the_nonces_it_did_not_write(panel, tmp_path):
+    # Two browsers, two sessions: logging one out must not resurrect the other,
+    # and the write goes under the same lock every other writer takes.
+    first = panel.make_session("admin")
+    second = panel.make_session("admin")
+    panel.logout(request(cookies={panel.SESSION_COOKIE: first}))
+    panel.logout(request(cookies={panel.SESSION_COOKIE: second}))
+
+    stored = json.loads((tmp_path / "auto.json").read_text())
+    assert len(stored["revoked"]) == 2
+    assert panel.session_payload(request(cookies={panel.SESSION_COOKIE: first})) == {}
+    assert panel.session_payload(request(cookies={panel.SESSION_COOKIE: second})) == {}
+
+
 def test_bearer_token_and_csrf_guard(panel):
     token = request(headers={"authorization": "Bearer token"})
     assert panel.require_auth(token) == "token"
