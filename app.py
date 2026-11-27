@@ -1909,6 +1909,22 @@ def auto_tick():
         note_consumer(CONSUMERS["immich_ml"], False)
 
 
+def refresh_slow_readings():
+    """Keep the two slow probes warm, so no request pays for them.
+
+    The models folder is a `pct exec` worth over a second and ComfyUI's state is
+    another; the dashboard polls every five seconds and both answer the same
+    between two of these ticks. Reading them here moves the cost off the request
+    path, which is what made one poll in three take 1.5 s.
+    """
+    if LLAMA_MODELS_DIR:
+        with contextlib.suppress(Exception):
+            models_on_disk(force=True)
+    if COMFY:
+        with contextlib.suppress(Exception):
+            comfy_state()
+
+
 async def auto_loop():
     while True:
         try:
@@ -1917,6 +1933,10 @@ async def auto_loop():
             # Swallowed, this used to leave the auto switch dead with the page
             # still showing "Auto: on".
             log.exception("the auto switch tick failed")
+        try:
+            await asyncio.to_thread(refresh_slow_readings)
+        except Exception:  # noqa: BLE001 - a warm-up is best effort
+            log.exception("the cached readings could not be refreshed")
         await asyncio.sleep(20)
 
 

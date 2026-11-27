@@ -349,8 +349,9 @@ router is still loading: they already hold the VRAM, so the dashboard treats
 them as in use. A consumer that is not configured answers
 `"unconfigured"` instead of an object, so a client can tell it apart from a
 consumer that is down. `disk_models` is `[]` until `LLAMA_MODELS_DIR` is set,
-and `{"error": …}` when the folder cannot be read; a failure is remembered for
-30 s, so a broken mount does not add its 8-second `find` to every poll. `served`
+and `{"error": …}` when the folder cannot be read. The folder and ComfyUI's
+state are read by the background tick, not by the request: a poll never pays
+their second of `pct exec`, and a failure is remembered for 30 s. `served`
 and `loaded` are `false` for every row while the router does not answer.
 
 Each `disk_models` row is a `*.gguf` file one level inside the folder. `size` is

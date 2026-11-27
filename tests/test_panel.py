@@ -2268,3 +2268,20 @@ def test_health_says_when_the_router_is_not_answering(panel):
     panel.llama_request = lambda *a, **kw: Reply(200, {"data": [{"id": "m", "status": {"value": "loaded"}}]})
     panel.llama_models()
     assert json.loads(panel.health().body)["router_ok"] is True
+
+
+def test_the_slow_readings_are_refreshed_off_the_request_path(monkeypatch, tmp_path):
+    panel = load(monkeypatch, tmp_path, LLAMA_MODELS_DIR="/mnt/models", COMFY_CONTAINER="comfyui")
+    calls = []
+
+    def disk(force=False):
+        calls.append(("disk", force))
+        raise RuntimeError("the folder is gone")
+
+    monkeypatch.setattr(panel, "models_on_disk", disk)
+    monkeypatch.setattr(panel, "comfy_state", lambda force=False: calls.append(("comfy", force)) or "running")
+
+    panel.refresh_slow_readings()
+
+    # Both are asked for, and a folder that fails does not stop the next tick.
+    assert calls == [("disk", True), ("comfy", False)]
